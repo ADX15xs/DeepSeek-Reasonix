@@ -171,7 +171,7 @@ function formatMessageTime(date: Date): string {
   return `${hours}:${minutes}`;
 }
 
-export function UserMessage({
+export const UserMessage = memo(function UserMessage({
   text,
   submitText,
   failed,
@@ -545,7 +545,7 @@ export function UserMessage({
       )}
     </div>
   );
-}
+});
 
 export function TurnActions({
   text,
