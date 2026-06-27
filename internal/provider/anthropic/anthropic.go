@@ -53,7 +53,6 @@ const (
 	defaultMaxTokens = 32768
 	// SSE protocol constants
 	dataPrefix = "data:"
-	doneMarker = "[DONE]"
 )
 
 func init() {
