@@ -538,7 +538,9 @@ func TestClearCommandRequiresConfirmationAndDiscardsSession(t *testing.T) {
 	}
 
 	m.runSlashCommand("/clear")
-	m.shellOutputs["shell-old"] = "old shell output\n"
+	b := &strings.Builder{}
+	b.WriteString("old shell output\n")
+	m.shellOutputs["shell-old"] = b
 	m.shellExpanded["shell-old"] = true
 	m.shellTranscriptIdx["shell-old"] = 2
 	next, _ = m.handleClearConfirmKey(tea.KeyPressMsg{Code: 'y'})
@@ -567,7 +569,9 @@ func TestClsClearsTranscriptDisplayState(t *testing.T) {
 	*m.pendingCommit = append(*m.pendingCommit, "stale pending")
 	m.transcript = []string{"banner", "shell card", "old shell output"}
 	m.wrappedLines = []string{"banner", "shell card", "old shell output"}
-	m.shellOutputs["shell-old"] = strings.Repeat("old shell output\n", shellPreviewLines+1)
+	b := &strings.Builder{}
+	b.WriteString(strings.Repeat("old shell output\n", shellPreviewLines+1))
+	m.shellOutputs["shell-old"] = b
 	m.shellExpanded["shell-old"] = false
 	m.shellTranscriptIdx["shell-old"] = 2
 	m.toolLineCountByID["shell-old"] = 3

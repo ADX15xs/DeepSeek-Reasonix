@@ -1612,7 +1612,7 @@ func (m *chatTUI) clearTranscriptDisplay() {
 	m.transcript = nil
 	m.wrappedLines = nil
 	m.viewport.SetContent("")
-	m.shellOutputs = make(map[string]string)
+	m.shellOutputs = make(map[string]*strings.Builder)
 	m.shellExpanded = make(map[string]bool)
 	m.shellTranscriptIdx = make(map[string]int)
 	m.toolLineCountByID = make(map[string]int)
