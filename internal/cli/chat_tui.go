@@ -2669,96 +2669,10 @@ func (m chatTUI) View() tea.View {
 		status = m.statusLineText
 		dataLine = m.dataLineText
 	} else {
-		color := statusAutoColor
-		foreground := "#111827"
-		switch {
-		case m.ctrl.AutoApproveTools():
-			color = statusYoloColor
-			foreground = "#ffffff"
-		case m.planMode:
-			color = statusPlanColor
-			foreground = "#ffffff"
-		}
-		modeTag = lipgloss.NewStyle().
-			Background(lipgloss.Color(color.hex)).
-			Foreground(lipgloss.Color(foreground)).
-			Bold(true).
-			Padding(0, 1).
-			Render(m.modeTagText())
 		sl := m.buildStatusLines(boxW)
 		working = sl.working
 		status = sl.status
 		dataLine = sl.dataLine
-	}
-
-	ctxTag := m.contextTag()
-	var status string
-	switch {
-	case m.rewind != nil:
-		status = "  " + modeTag + " · ⟲ rewind"
-	case m.mcpImport != nil:
-		status = "  " + modeTag + " · MCP import"
-	case m.resumePick != nil:
-		status = "  " + modeTag + " · " + i18n.M.StatusResumePicker
-	case m.mcp != nil:
-		status = "  " + modeTag + " · MCP"
-	case m.skillPick != nil:
-		status = "  " + modeTag + " · " + i18n.M.SkillPickerStatusLabel
-	case m.chooser != nil:
-		status = "  " + modeTag + " · " + i18n.M.ChatStatusQuestion
-	case m.pendingApproval != nil && m.pendingApproval.Tool == planApprovalTool:
-		status = "  " + modeTag + " · " + i18n.M.ChatStatusPlanApproval
-	case m.pendingApproval != nil:
-		status = "  " + modeTag + " · " + i18n.M.ChatStatusToolApproval
-	case m.copyNoticeText != "":
-		status = "  " + modeTag + " · " + green(m.copyNoticeText)
-	case cancelRequested:
-		status = "  " + modeTag + " · " + i18n.M.CtrlCQuitHint
-	case shellMode:
-		status = "  " + modeTag + " · " + i18n.M.ShellModeHint
-	case m.ctrl.AutoApproveTools():
-		status = "  " + modeTag + " · " + i18n.M.ChatStatusYoloIdle + " " + dim("("+m.cycleHint()+")")
-	default:
-		status = "  " + modeTag + " · " + i18n.M.ChatStatusIdle + " " + dim("("+m.cycleHint()+")")
-	}
-	if et := m.effortTag(); et != "" {
-		status += " · " + et
-	}
-	if gt := m.gitTag(); gt != "" {
-		status += " · " + gt
-	}
-	if mt := m.mouseTag(); mt != "" {
-		status += " · " + mt
-	}
-	// The spinning "thinking…" indicator is its own line ABOVE the input box (shown
-	// only while a turn runs); the status/data rows stay below. This mirrors Claude
-	// Code: live progress over the composer, shortcuts + stats under it.
-	working := m.runningWorkingLine(cancelRequested, true)
-	// Second status row: the live data (model, git, effort, context gauge, cache
-	// rates, jobs, balance). It lives on its own row so it's always visible; if it
-	// exceeds the terminal width it wraps to additional rows instead of being
-	// truncated. Wrapping is safe in the alt-screen view — there's no scrollback
-	// to strand — and computeStatusLineCount reserves the correct height.
-	var data []string
-	if mt := m.modelTag(); mt != "" {
-		data = append(data, mt)
-	}
-	if cache := m.cacheTag(); cache != "" {
-		data = append(data, cache)
-	}
-	if ctxTag != "" {
-		data = append(data, ctxTag)
-	}
-	if jt := m.jobsTag(); jt != "" {
-		data = append(data, jt)
-	}
-	if m.balance != "" {
-		data = append(data, dim(m.balance))
-	}
-	dataLine := "  " + strings.Join(data, " · ")
-	// A configured custom status line replaces the built-in data row entirely.
-	if m.statuslineCmd != "" && m.statuslineOut != "" {
-		dataLine = "  " + m.statuslineOut
 	}
 
 	// Bottom region pinned under the transcript viewport: optional panels, the
@@ -3333,7 +3247,7 @@ func (m chatTUI) buildStatusLines(width int) statusLines {
 	case m.pendingApproval != nil:
 		status = "  " + modeTag + " · " + i18n.M.ChatStatusToolApproval
 	case m.copyNoticeText != "":
-		status += " · " + m.copyNoticeText
+		status = "  " + modeTag + " · " + green(m.copyNoticeText)
 	case cancelRequested:
 		status = "  " + modeTag + " · " + i18n.M.CtrlCQuitHint
 	case shellMode:
