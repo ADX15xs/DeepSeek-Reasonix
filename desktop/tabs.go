@@ -1126,9 +1126,7 @@ func coalesceEventDeltas(events []event.Event) []event.Event {
 		return events
 	}
 	out := make([]event.Event, 0, len(events))
-	// builder accumulates the current same-kind run; builderKind tracks which
-	// event.Kind it belongs to. The builder is flushed (String() + Reset) when
-	// the run ends or at function exit.
+	// builder merges consecutive deltas of the same Kind.
 	var builder strings.Builder
 	builderKind := event.Kind(-1)
 	for _, e := range events {
@@ -1136,17 +1134,12 @@ func coalesceEventDeltas(events []event.Event) []event.Event {
 			builder.WriteString(e.Text)
 			continue
 		}
-		// Run ended: flush previous run. The base event for the previous run
-		// is the first event of that run, already appended to `out`
-		// provisionally with an empty Text. Replace its Text with the builder
-		// output.
+		// Flush accumulated text into the last output event.
 		if builderKind != event.Kind(-1) {
 			out[len(out)-1].Text = builder.String()
 			builder.Reset()
 		}
-		// Start new run. Append a placeholder event with empty Text; we'll
-		// fill it in when the run ends. Use the current event as the base so
-		// non-Text fields (e.g. Signature for reasoning) are preserved.
+		// Start a new run group; non-Text fields come from the first event.
 		builderKind = e.Kind
 		base := e
 		base.Text = ""

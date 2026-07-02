@@ -340,16 +340,8 @@ type chatTUI struct {
 	dataLineText      string
 	statusWidth       int
 
-	// Bottom panel row-count cache. bottomRows() previously called
-	// renderTodoPanel/renderApprovalBanner/renderChooser/renderRewind/
-	// renderMCPImport/renderResumePicker/renderCompletion/renderMainManager/
-	// renderMainManagerFooter each frame JUST to count newlines via
-	// strings.Count — View() then re-rendered the same panels for display,
-	// so every active panel was rendered twice per frame. Update() now
-	// renders them once via buildBottomPanelsRowCount and caches the total;
-	// bottomRows() reads the cached count. Width is tracked to invalidate
-	// on resize. Zero width = stale cache (initial frame / before first
-	// Update), so bottomRows falls back to on-the-fly rendering.
+	// buildBottomPanelsRowCount caches panel row counts so bottomRows()
+	// avoids re-rendering panels just for newline counting.
 	bottomPanelsRowsWidth int
 	bottomPanelsRows      int
 
@@ -790,10 +782,7 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	cm.dataLineText = sl.dataLine
 	cm.statusWidth = boxW
 	cm.statusLineCount = sl.wrappedLines
-	// Render all bottom panels once and cache the total row count so
-	// bottomRows() doesn't re-render them just to count newlines. View()
-	// still renders the panels for display; the cache eliminates the second
-	// render that previously happened inside bottomRows each frame.
+	// Cache panel row counts to avoid double-rendering.
 	cm.buildBottomPanelsRowCount()
 	cm.viewport.SetHeight(cm.transcriptHeight())
 	// Re-feed only when the content grew or the width changed (re-wrapping is
@@ -805,10 +794,9 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cm.wrapDirtyFrom = prevLines
 		}
 		if cm.width != prevWidth {
-			// Width changed: every line must be re-wrapped.
 			cm.wrapAllLines(contentW)
 		} else {
-			// Incremental: re-wrap only the dirty tail (TR-1).
+			// Incremental: re-wrap only the dirty tail.
 			cm.wrapIncremental(contentW)
 		}
 		cm.viewport.SetContent(strings.Join(cm.wrappedLines, "\n"))
@@ -1722,7 +1710,7 @@ func (m *chatTUI) wrapIncremental(contentW int) {
 	if m.wrapDirtyFrom < 0 {
 		return
 	}
-	// Truncation or cache mismatch: full re-wrap.
+	// Fallback: full re-wrap on truncation.
 	if len(m.lineWrapCounts) > len(m.transcript) || m.lineWrapCounts == nil {
 		m.wrapAllLines(contentW)
 		return
