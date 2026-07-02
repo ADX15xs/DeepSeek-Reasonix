@@ -135,7 +135,6 @@ func (m chatTUI) renderTranscript() string {
 	start, end := m.sel.ordered()
 	thumbStart, thumbSize := scrollbarThumb(h, yoff, total)
 
-	
 	if cw != blankRowWidth || (cw > 0 && blankRow == "") {
 		blankRow = strings.Repeat(" ", cw)
 		blankRowWidth = cw

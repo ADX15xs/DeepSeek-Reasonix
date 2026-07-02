@@ -18,6 +18,7 @@ func streamedRows(s string, width int) int {
 	var rows int
 	var currentLineWidth int
 	var inEscape bool
+	var isOSC bool // ESC] sequence; only BEL/ST terminate, not letters
 
 	for _, r := range s {
 		switch {
@@ -29,10 +30,19 @@ func streamedRows(s string, width int) int {
 			}
 			rows++
 		case r == '\x1b':
-			// Start of ANSI escape sequence
+			// Start of ANSI escape sequence (CSI, OSC, etc.)
 			inEscape = true
-		case inEscape && (r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z'):
+			isOSC = false
+		case inEscape && r == ']':
+			// ESC] starts an OSC sequence (e.g. ESC]0;title)
+			isOSC = true
+		case inEscape && r == '\x07':
+			// BEL terminates an OSC sequence (ESC]...#BEL).
+			inEscape = false
+			isOSC = false
+		case inEscape && !isOSC && (r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z'):
 			// Any ASCII letter terminates a CSI sequence (X3.64).
+			// Not applied in OSC mode — OSC duration is delimited by BEL/ST.
 			inEscape = false
 		default:
 			if !inEscape {
