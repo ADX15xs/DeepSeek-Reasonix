@@ -62,6 +62,29 @@ func TestStreamedRowsIgnoresOSC(t *testing.T) {
 	}
 }
 
+// TestStreamedRowsOSCWithSTTerminator: OSC sequences terminated with ST
+// (ESC \) must be handled correctly - visible characters after the ST must
+// be counted, not silently ignored.
+func TestStreamedRowsOSCWithSTTerminator(t *testing.T) {
+	// OSC title set with ST terminator (ESC \), followed by visible text.
+	in := "\x1b]0;hello world\x1b\\visible"
+	// "visible" is 7 chars at width 10, no wrap: rows = 0
+	if got := streamedRows(in, 10); got != 0 {
+		t.Errorf("OSC with ST terminator: 7-char visible at width 10 should be 0 rows, got %d", got)
+	}
+	// OSC with ST terminator, followed by text that wraps.
+	in2 := "\x1b]0;title\x1b\\abcdefghijk" // 11 chars -> 1 wrap
+	if got := streamedRows(in2, 10); got != 1 {
+		t.Errorf("OSC with ST + 11-char line at width 10 should be 1 row (wrap), got %d", got)
+	}
+	// OSC with ST terminator, followed by digits only (no letters to
+	// accidentally reset inEscape via CSI terminator path).
+	in3 := "\x1b]0;title\x1b\\12345678"
+	if got := streamedRows(in3, 80); got != 0 {
+		t.Errorf("OSC with ST + 8-digit line at width 80 should be 0 rows, got %d", got)
+	}
+}
+
 // TestStreamedRowsIgnoresAnsi: ANSI SGR codes must not inflate the row count.
 func TestStreamedRowsIgnoresAnsi(t *testing.T) {
 	in := "\x1b[1mhello\x1b[0m world"

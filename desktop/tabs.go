@@ -929,8 +929,7 @@ type tabEventSink struct {
 	// flushes the buffer first. Accessed from Emit (serial per Sink contract)
 	// and clearContext (under mu).
 	coalesceBuf []event.Event
-	// flushStop signals the periodic flush goroutine to exit. It is created
-	// in setContext and closed in clearContext.
+	// Signals the periodic flush goroutine to exit.
 	flushStop chan struct{}
 }
 
@@ -992,9 +991,9 @@ func (s *tabEventSink) Emit(e event.Event) {
 		s.mu.Unlock()
 	} else {
 		s.flushCoalesced()
-		s.emitRuntimeEvent(eventChannel, toWireTab(e, s.tabID))
+		s.emitRuntimeEvent(eventChannel, toWireTab(e, tabID))
 	}
-	if s.app != nil {
+	if app != nil {
 		if status, update := topicActivityStatusFromEvent(e); update {
 			changed := app.setTabActivityStatus(tabID, status)
 			if changed || isBackgroundJobLifecycleNotice(e) {
@@ -1098,9 +1097,7 @@ func (s *tabEventSink) cancelTurnStart() {
 	s.mu.Unlock()
 }
 
-// flushCoalesced drains the coalesce buffer, merges consecutive same-kind
-// deltas, and emits each merged event to the Wails bridge. Called on any
-// non-Text/Reasoning event.
+// Drains and merges coalesced deltas, emits to the Wails bridge.
 func (s *tabEventSink) flushCoalesced() {
 	s.mu.Lock()
 	buf := s.coalesceBuf
@@ -1109,18 +1106,17 @@ func (s *tabEventSink) flushCoalesced() {
 	if len(buf) == 0 {
 		return
 	}
+	tabID, _ := s.binding()
 	if len(buf) == 1 {
-		s.emitRuntimeEvent(eventChannel, toWireTab(buf[0], s.tabID))
+		s.emitRuntimeEvent(eventChannel, toWireTab(buf[0], tabID))
 		return
 	}
 	for _, e := range coalesceEventDeltas(buf) {
-		s.emitRuntimeEvent(eventChannel, toWireTab(e, s.tabID))
+		s.emitRuntimeEvent(eventChannel, toWireTab(e, tabID))
 	}
 }
 
-// coalesceEventDeltas merges consecutive Text/Reasoning deltas so the Wails
-// bridge receives fewer events during streaming. Same-kind runs are accumulated
-// via a strings.Builder to keep long runs O(n), not O(n²).
+// Merges consecutive same-kind deltas into fewer events.
 func coalesceEventDeltas(events []event.Event) []event.Event {
 	if len(events) <= 1 {
 		return events
@@ -1156,10 +1152,7 @@ func coalesceEventDeltas(events []event.Event) []event.Event {
 func (s *tabEventSink) setContext(ctx context.Context) {
 	s.mu.Lock()
 	s.ctx = ctx
-	// Start a periodic flush goroutine so coalesced Text/Reasoning deltas
-	// are delivered incrementally during pure-text streaming (where no
-	// non-Text event arrives to trigger a flush until the stream closes).
-	// The goroutine exits when flushStop is closed (in clearContext).
+	// Periodic flush goroutine for pure-text streaming; exits when flushStop is closed.
 	if s.flushStop == nil {
 		s.flushStop = make(chan struct{})
 		stop := s.flushStop
@@ -1180,9 +1173,7 @@ func (s *tabEventSink) setContext(ctx context.Context) {
 }
 
 func (s *tabEventSink) clearContext() {
-	// Flush any buffered deltas before clearing the context so the frontend
-	// receives the final coalesced text instead of losing it. flushCoalesced
-	// needs a non-nil ctx to emit, so we flush first, then nil out ctx.
+	// Flush buffered deltas before clearing context so the frontend receives the final text.
 	s.flushCoalesced()
 	s.mu.Lock()
 	s.ctx = nil
@@ -1221,21 +1212,10 @@ type runtimeEventEnvelope struct {
 	payload []interface{}
 }
 
-// asyncRuntimeEmitter decouples Wails' runtime event bridge from agent
-// emission. runtime.EventsEmit can block when the single webview event channel
-// backs up; callers enqueue in-order work and return without holding the
-// agent's event.Sync lock.
-// runtimeEventsEmitFallback is the emit used when no per-instance override is
-// installed. Production keeps the real Wails bridge; the test binary swaps in
-// a no-op via TestMain, because Wails EventsEmit log.Fatals outside a running
-// Wails app and would kill the whole test process from any code path that
-// emits a runtime event with a plain Background context.
+// asyncRuntimeEmitter decouples Wails' runtime event bridge from agent emission.
 var runtimeEventsEmitFallback runtimeEventEmitFunc = runtime.EventsEmit
 
-// Backpressure: the queue is capped at asyncEmitterMaxQueue pending events.
-// If the webview event channel backs up and the queue fills, the oldest
-// events are dropped to prevent unbounded memory growth (matching the
-// Broadcaster's drop policy).
+// Queue capped at asyncEmitterMaxQueue; drops oldest when full (backpressure).
 type asyncRuntimeEmitter struct {
 	mu      sync.Mutex
 	emit    runtimeEventEmitFunc
@@ -1258,8 +1238,7 @@ func (e *asyncRuntimeEmitter) Emit(ctx context.Context, name string, payload ...
 		payload: append([]interface{}(nil), payload...),
 	}
 	e.mu.Lock()
-	// Backpressure: cap the pending queue. If the webview event channel backs
-	// up and the queue fills, drop the oldest quarter to amortize the cost.
+	// Backpressure: drop oldest quarter when queue is full.
 	pending := len(e.queue) - e.head
 	if pending >= asyncEmitterMaxQueue {
 		drop := pending / 4

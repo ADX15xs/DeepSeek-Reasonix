@@ -136,67 +136,42 @@ type chatTUI struct {
 	renderer      *mdRenderer
 	showReasoning bool // Ctrl+O / /verbose: show raw thinking text in the CLI
 	cfg           *config.Config
-	// lastParagraphBreak tracks the last complete paragraph boundary position in
-	// pending, so flushableMarkdownPrefix can avoid re-scanning the entire buffer.
+	// Last paragraph break byte offset for incremental scanning.
 	lastParagraphBreak int
-	// reasoningLineIdx is the transcript index of the live "▎ thinking…" marker
-	// while a reasoning block streams; it's rewritten to "▎ thought for Ns" when
-	// the block closes. -1 when no block is open. transcriptDirty forces a
-	// viewport re-feed after that in-place rewrite (length is unchanged).
+	// Transcript index of the "▎ thinking…" marker; -1 when none.
 	reasoningLineIdx int
-	// reasoningTextIdx is the transcript index of the live reasoning text block
-	// (the block right after the marker), streamed in as the model thinks and
-	// removed when the block collapses (kept only in verbose mode). -1 when none.
+	// Transcript index of the live reasoning text block; -1 when none.
 	reasoningTextIdx int
-	// reasoningView is a bounded trailing window (≤ reasoningViewMax bytes) of the
-	// streaming thought, rendered live; the full text stays in reasoning for verbose.
+	// Bounded trailing window of the streaming thought, rendered live.
 	reasoningView []byte
 	// reasoningNative is the Termux/native-scrollback path: reasoning is buffered
 	// without a live transcript block, then appended once as a final summary.
 	reasoningNative bool
 	thinkStart      time.Time
-	// answerIdx is the transcript index of the streaming answer block (rewritten in
-	// place as completed paragraphs arrive); -1 when none is open. answerFlushed is
-	// how many bytes of pending have already been rendered into it, so a Text packet
-	// that doesn't close a new paragraph re-renders nothing.
+	// Transcript index of the streaming answer block; -1 when none. answerFlushed tracks bytes already rendered.
 	answerIdx     int
 	answerFlushed int
-	// toolStreamIdx is the transcript index of a running tool's live-output block
-	// (streamed via ToolProgress under the tool card); -1 when none. toolStreamID
-	// is the call ID it belongs to. Only a bounded tail is kept — the last few
-	// complete lines (toolTail) plus the in-progress one (toolPartial) — so a
-	// high-output command can't balloon memory or cost O(n²) re-splitting;
-	// toolLineCount feeds the collapse summary.
+	// Transcript index of the running tool's live-output block; -1 when none. Bounded tail + in-progress line.
 	toolStreamIdx int
 	toolStreamID  string
 	toolTail      []string
 	toolPartial   string
 	toolLineCount int
-	// shellOutputs stores the full accumulated output of each shell command
-	// (tool IDs with "shell-" prefix), so the first 10 lines can be shown after
-	// collapse and Ctrl+B can toggle the complete output. Uses *strings.Builder
-	// for amortized O(1) appends instead of O(n) string concatenation.
+	// Full accumulated output of each shell command, keyed by tool ID ("shell-*").
 	shellOutputs  map[string]*strings.Builder
 	shellExpanded map[string]bool
 	// shellTranscriptIdx maps a shell tool ID to the transcript index of its
 	// collapsed output block, so Ctrl+B can rewrite it in place.
 	shellTranscriptIdx map[string]int
-	// toolLineCountByID keeps a switched-away tool's last line count so a late
-	// ToolResult can still render "⎿ N lines" (shellOutputs only tracks "shell-" ids).
+	// Keeps switched-away tool's last line count for late ToolResult rendering.
 	toolLineCountByID map[string]int
-	// toolStreamStart / toolStreamFrame drive the "⎿ working · Ns" line shown
-	// under a dispatched tool that hasn't produced output yet, so a slow tool
-	// reads as making progress rather than frozen.
+	// Drive the "⎿ working · Ns" indicator for slow tools.
 	toolStreamStart time.Time
 	toolStreamFrame int
 	transcriptDirty bool
-	// wrapDirtyFrom is the first transcript line index whose wrapped output is
-	// stale (-1 = clean). Set by markTranscriptDirty; consumed by wrapIncremental
-	// to re-wrap only the dirty tail instead of the full transcript (TR-1).
+	// First transcript line with stale wrapped output; -1 = clean.
 	wrapDirtyFrom int
-	// lineWrapCounts[i] is the number of visual rows that transcript[i] occupies
-	// after wrapping. Used by wrapIncremental to compute the splice offset into
-	// wrappedLines without re-wrapping the clean prefix.
+	// Visual rows per transcript line, used by wrapIncremental for splice offset.
 	lineWrapCounts []int
 	// forceGotoBottom is set by replayActiveBranch and resetFreshContextView to
 	// pin the viewport to the bottom after a session / branch / clear switch
@@ -205,65 +180,42 @@ type chatTUI struct {
 	eventCh         chan event.Event
 	started         bool // banner + resumed history committed once
 
-	// transcript holds every finalized line commitLine emits; the viewport
-	// renders a scrollable window of it (alt-screen owns the grid, so there's no
-	// native terminal scrollback). sel is the live left-drag text selection.
+	// Finalized transcript lines; viewport renders a scrollable window.
 	transcript   []string
 	wrappedLines []string // transcript wrapped to viewport width (rendered each frame)
 	viewport     viewport.Model
 	sel          selection
-	// autoScroll drives edge-drag scrolling: -1 up, +1 down, 0 off. dragX is the
-	// column the drag is held at, so the ticker can extend the selection head.
+	// Edge-drag scrolling: -1 up, +1 down, 0 off. dragX is the drag column.
 	autoScroll int
 	dragX      int
-	// scrollbarDrag owns left-button drags that start on the transcript scrollbar
-	// column. It is separate from text selection so the visual thumb is not a
-	// dead target and dragging it never leaves a transcript selection behind.
+	// Owns scrollbar drags, separate from text selection.
 	scrollbarDrag       bool
 	scrollbarGrabOffset int
-	// copyNoticeText is a transient "copied to clipboard" hint shown on the status
-	// line after a mouse-drag, right-click, or Ctrl+C selection copy; "" when none
-	// is showing. copyNoticeSeq guards its expiry tick so an older copy's timer
-	// can't clear a newer notice — each copy bumps the sequence and only a tick
-	// carrying the current sequence clears the text.
+	// copyNoticeText is transient "copied to clipboard" text; "" when none. copyNoticeSeq guards expiry.
 	copyNoticeText string
 	copyNoticeSeq  int
 
-	// The user bubble is echoed to scrollback immediately on Enter (bubbleStartIdx
-	// marks where in the transcript it landed). It stays "un-sendable" until the
-	// first response packet arrives: pressing Esc/Ctrl+C before then pops those
-	// lines back off the transcript and restores the text to the input box, leaving
-	// no trace. bubblePending is true from startTurn until the first packet confirms
-	// the send or it's un-sent; turnDiscarded then swallows the turn's
-	// already-buffered events until its TurnDone settles.
+	// Bubble pending state: user message not yet confirmed by first response packet.
 	pendingRestore string
 	pendingPastes  []string
 	bubbleStartIdx int
 	bubblePending  bool
 	turnDiscarded  bool
 
-	// pendingApproval holds the tool-call approval currently shown in the banner
-	// (nil when none). While set, the controller's run goroutine is blocked
-	// awaiting ctrl.Approve and key input is captured to answer it.
+	// pendingApproval holds the tool-call approval banner; nil when none.
 	pendingApproval *event.Approval
 
-	// chooser holds the `ask` tool's question card (nil when none). While set, the
-	// run goroutine is blocked awaiting ctrl.AnswerQuestion and keys drive the card.
+	// chooser holds the `ask` tool's question card; nil when none.
 	chooser *chooser
 
-	// rewind holds the Esc-Esc / "/rewind" picker (nil when closed); while set,
-	// keys drive it and it renders as an overlay. lastEsc times the double-Esc
-	// gesture that opens it on an empty composer.
+	// rewind holds the Esc-Esc / "/rewind" picker; nil when closed.
 	rewind *rewindPicker
-	// resumePick is the interactive "/resume" session picker overlay. Non-nil
-	// while the user browses saved sessions with ↑/↓ and confirms with Enter.
+	// resumePick is the interactive "/resume" session picker overlay.
 	resumePick *resumePicker
 	copyPick   *copyPicker
 	lastEsc    time.Time
 
-	// mcp is the interactive "/mcp" manager overlay. mcpDisabled tracks servers
-	// turned off only for this chat session, matching the desktop connector
-	// toggle's non-persistent semantics.
+	// mcp is the interactive "/mcp" manager overlay.
 	mcp         *mcpManager
 	mcpDisabled map[string]bool
 
@@ -271,38 +223,25 @@ type chatTUI struct {
 	// from /new because /clear discards the current transcript instead of saving it.
 	clearConfirm *clearConfirm
 
-	// lastCtrlCAt records when Ctrl+C was pressed while idle on an empty
-	// composer, enabling a "press again to quit" confirmation pattern (1.5s
-	// window). Reset when Ctrl+C clears non-empty input instead.
+	// lastCtrlCAt records when Ctrl+C was pressed while idle for double-press-to-quit (1.5s window).
 	lastCtrlCAt time.Time
 
-	// mcpImport holds the interactive cc-switch MCP import picker (nil when
-	// closed). It writes selected servers to config and hot-connects the ones that
-	// can start successfully.
+	// mcpImport holds the cc-switch MCP import picker; nil when closed.
 	mcpImport *mcpImportPicker
 
-	// host is the running MCP servers (nil when no plugins). The TUI reads
-	// prompts (slash commands), resources (@-references), and server status
-	// (/mcp) from it.
+	// host is the running MCP servers (nil when no plugins).
 	host *plugin.Host
 
-	// commands are custom slash commands loaded from .reasonix/commands; each renders
-	// its template with the typed args and sends the result as a turn.
+	// commands are custom slash commands loaded from .reasonix/commands.
 	commands []command.Command
 
-	// skills are the discoverable skills (built-in + user/project); each is offered
-	// in the slash menu as "/<name>" and managed via /skills.
+	// skills are discoverable skills (built-in + user/project), offered via /skills.
 	skills []skill.Skill
 
-	// skillPick is the interactive skill picker overlay for /skills. nil when closed.
+	// skillPick is the interactive skill picker overlay for /skills; nil when closed.
 	skillPick *skillPicker
 
-	// buildController builds a fresh controller on a model ref, carrying prior
-	// history across and pinning auto-save to resumePath so the continued
-	// conversation stays in one file (set by chatREPL; it must NOT touch this
-	// model — the swap happens in runModelSubcommand on the running copy). nil
-	// disables /model. modelRef is the active "provider/model" ref, marked
-	// current in the picker.
+	// buildController builds a fresh controller on a model ref; nil disables /model.
 	buildController func(ref string, carry []provider.Message, resumePath string) (*control.Controller, error)
 	modelRef        string
 	effortLevel     string // "" when the current provider/model has no configurable effort
@@ -329,19 +268,15 @@ type chatTUI struct {
 	statuslineOut string
 	gitStatus     gitStatus
 
-	// statusLineCount is the number of terminal rows the status block occupies
-	// (wrapped working line + wrapped status line + wrapped data line). Updated
-	// each frame via computeStatusLineCount so bottomRows can reserve the correct
-	// height; starts at 2 (unwrapped) until first render.
+	// Terminal rows the status block occupies; used by bottomRows for height reservation.
 	statusLineCount int
-	// Status line cache fields (TR-6)
+	// Status line cache fields
 	statusWorkingText string
 	statusLineText    string
 	dataLineText      string
 	statusWidth       int
 
-	// buildBottomPanelsRowCount caches panel row counts so bottomRows()
-	// avoids re-rendering panels just for newline counting.
+	// Cached panel row count to avoid double-rendering in bottomRows.
 	bottomPanelsRowsWidth int
 	bottomPanelsRows      int
 
@@ -770,7 +705,7 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	cm.viewport.SetWidth(contentW)
 	// Recompute the wrapped status-line count so bottomRows reserves the right
 	// height for the viewport. Build the status block once and cache the text
-	// so View() can render without recomputing (TR-6). Use the same clamped
+	// so View() can render without recomputing. Use the same clamped
 	// width (boxW) that View() uses for wrapping.
 	boxW := cm.width
 	if boxW < 10 {
@@ -2646,7 +2581,7 @@ func (m chatTUI) View() tea.View {
 		box = style.Render(m.input.View())
 	}
 
-	// Read cached status lines (populated by Update via buildStatusLines, TR-6).
+	// Read cached status lines (populated by Update via buildStatusLines).
 	// contextTag() and all tag builders run exactly once inside buildStatusLines;
 	// View() only wraps the cached text with lipgloss styles. Fall back to
 	// building on-the-fly for the initial render (before the first Update) or

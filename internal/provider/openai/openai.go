@@ -623,11 +623,7 @@ func (c *client) readStream(ctx context.Context, resp *http.Response, out chan<-
 	}()
 
 	acc := map[int]*provider.ToolCall{}
-	// argsBuilders accumulates streamed tool-call argument fragments per index.
-	// Writing into a strings.Builder per call avoids the O(n²) string
-	// concatenation that cur.Arguments += delta would incur for long tool
-	// argument streams (e.g. large edit_file patches). The concatenated string
-	// is materialised once when the call is finalised below.
+	// Accumulates streamed tool-call argument fragments per index, materialised when the call is finalised.
 	argsBuilders := map[int]*strings.Builder{}
 	started := map[int]bool{}
 	var order []int

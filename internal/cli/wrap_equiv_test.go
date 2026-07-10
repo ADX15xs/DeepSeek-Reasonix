@@ -8,7 +8,7 @@ import (
 // TestWrapIncrementalEquivalentToFull verifies that incremental re-wrapping
 // (wrapIncremental) produces byte-identical output to a full re-wrap
 // (wrapAllLines), across append, in-place rewrite, and truncation scenarios.
-// This is the correctness invariant that lets TR-1 skip re-wrapping the clean
+// This is the correctness invariant that lets incremental re-wrapping skip the clean
 // prefix of the transcript.
 func TestWrapIncrementalEquivalentToFull(t *testing.T) {
 	cases := []struct {
