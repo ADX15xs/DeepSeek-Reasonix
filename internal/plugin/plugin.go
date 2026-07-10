@@ -1164,9 +1164,9 @@ func (c *Client) listTools(ctx context.Context) ([]tool.Tool, error) {
 		}
 	}
 
-	toolInfos := make([]ToolInfo, 0, len(out.Tools))
-	tools := make([]tool.Tool, 0, len(out.Tools))
-	for _, t := range out.Tools {
+	toolInfos := make([]ToolInfo, 0, len(out))
+	tools := make([]tool.Tool, 0, len(out))
+	for _, t := range out {
 		if c.spec.isToolDisabled(t.Name) {
 			continue
 		}
