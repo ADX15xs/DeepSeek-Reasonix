@@ -226,6 +226,9 @@ func transcriptBlockLineCount(block string, width int) int {
 	return strings.Count(wrapTranscript(block, width), "\n") + 1
 }
 
+// wrapStyle caches the lipgloss style for transcript wrapping
+var wrapStyle lipgloss.Style
+var wrapStyleWidth int
 
 // wrapTranscript wraps the joined transcript to width for the viewport, keeping
 // SGR balanced across wrap points. ansi.Hardwrap leaves a style that spans a
