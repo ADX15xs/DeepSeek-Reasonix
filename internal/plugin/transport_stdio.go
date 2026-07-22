@@ -150,9 +150,6 @@ func prepareMCPPrivateStateForOS(s Spec, processSandbox sandbox.Spec, env []stri
 	dirs := []string{cacheDir, stateDir}
 	privateEnv := map[string]string{
 		"XDG_CACHE_HOME": cacheDir, "XDG_STATE_HOME": stateDir,
-		"npm_config_cache":      filepath.Join(cacheDir, "npm"),
-		"UV_CACHE_DIR":          filepath.Join(cacheDir, "uv"),
-		"BUN_INSTALL_CACHE_DIR": filepath.Join(cacheDir, "bun"),
 	}
 	if goos != "windows" {
 		tmpDir := filepath.Join(privateRoot, "tmp")
@@ -160,6 +157,9 @@ func prepareMCPPrivateStateForOS(s Spec, processSandbox sandbox.Spec, env []stri
 		privateEnv["TMP"] = tmpDir
 		privateEnv["TEMP"] = tmpDir
 		privateEnv["TMPDIR"] = tmpDir
+		privateEnv["npm_config_cache"] = filepath.Join(cacheDir, "npm")
+		privateEnv["UV_CACHE_DIR"] = filepath.Join(cacheDir, "uv")
+		privateEnv["BUN_INSTALL_CACHE_DIR"] = filepath.Join(cacheDir, "bun")
 	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0o700); err != nil {

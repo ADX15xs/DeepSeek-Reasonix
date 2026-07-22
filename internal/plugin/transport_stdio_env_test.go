@@ -51,6 +51,11 @@ func TestPrepareMCPPrivateStateWindowsPreservesHostTemp(t *testing.T) {
 			t.Fatalf("%s = %q, %v; want %q", key, value, ok, want)
 		}
 	}
+	for _, key := range []string{"npm_config_cache", "UV_CACHE_DIR", "BUN_INSTALL_CACHE_DIR"} {
+		if _, ok := envValue(got, key); ok {
+			t.Fatalf("%s set on Windows; package manager caches must keep the host global path to avoid MAX_PATH during source builds", key)
+		}
+	}
 }
 
 func TestPrepareMCPPrivateStateUnixIsolatesTemp(t *testing.T) {
