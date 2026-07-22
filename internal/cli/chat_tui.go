@@ -789,18 +789,9 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Re-feed only when the content grew or the width changed (re-wrapping is
 	// the expensive part); a bare scroll or spinner tick keeps the offset.
 	if len(cm.transcript) != prevLines || cm.width != prevWidth || cm.transcriptDirty {
-		// If lines were appended without an explicit dirty mark (commitLine),
-		// mark the new tail as dirty so wrapIncremental picks it up.
-		if len(cm.transcript) > prevLines && cm.wrapDirtyFrom < 0 {
-			cm.wrapDirtyFrom = prevLines
-		}
-		if cm.width != prevWidth {
-			cm.wrapAllLines(contentW)
-		} else {
-			// Incremental: re-wrap only the dirty tail.
-			cm.wrapIncremental(contentW)
-		}
-		cm.viewport.SetContent(strings.Join(cm.wrappedLines, "\n"))
+		wrapped := wrapTranscript(strings.Join(cm.transcript, "\n"), contentW)
+		cm.viewport.SetContent(wrapped)
+		cm.wrappedLines = strings.Split(wrapped, "\n")
 		if wasAtBottom {
 			cm.viewport.GotoBottom() // tail-follow: stay pinned to newest output
 		} else if cm.width != prevWidth && resizeAnchor.valid {
