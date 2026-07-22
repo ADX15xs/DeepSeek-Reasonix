@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"strings"
@@ -11,6 +14,7 @@ import (
 
 	"reasonix/internal/config"
 	"reasonix/internal/control"
+	"reasonix/internal/mcpregistry"
 	"reasonix/internal/plugin"
 )
 
@@ -153,6 +157,46 @@ func TestMCPGetMissingServerFails(t *testing.T) {
 	}
 }
 
+func TestMCPBrowseAndInstallOfficialRegistryEntry(t *testing.T) {
+	isolateCLIConfigHome(t)
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"servers": []any{map[string]any{"server": map[string]any{
+			"name": "io.example/demo", "title": "Demo MCP", "version": "1.0.0",
+			"remotes": []any{map[string]any{"type": "streamable-http", "url": "https://mcp.example.test/mcp"}},
+		}}}})
+	}))
+	defer registry.Close()
+	client := mcpregistry.New("")
+	client.BaseURL = registry.URL
+
+	browseOut := captureStdout(t, func() {
+		if rc := mcpBrowseWithClient([]string{"demo", "--limit", "5"}, client); rc != 0 {
+			t.Fatalf("mcp browse rc = %d", rc)
+		}
+	})
+	for _, want := range []string{"io.example/demo", "1.0.0", "http", "Demo MCP"} {
+		if !strings.Contains(browseOut, want) {
+			t.Fatalf("mcp browse output missing %q: %s", want, browseOut)
+		}
+	}
+
+	installOut := captureStdout(t, func() {
+		if rc := mcpInstallWithClient([]string{"io.example/demo", "--as", "demo-market"}, client); rc != 0 {
+			t.Fatalf("mcp install rc = %d", rc)
+		}
+	})
+	if !strings.Contains(installOut, `installed MCP Registry server "io.example/demo" as "demo-market"`) {
+		t.Fatalf("mcp install output = %q", installOut)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Plugins) != 1 || cfg.Plugins[0].Name != "demo-market" || cfg.Plugins[0].Type != "http" || cfg.Plugins[0].URL != "https://mcp.example.test/mcp" {
+		t.Fatalf("installed plugins = %+v", cfg.Plugins)
+	}
+}
+
 func TestMCPGetRedactsRemoteAuthMaterial(t *testing.T) {
 	isolateCLIConfigHome(t)
 
@@ -227,6 +271,26 @@ func TestRenderMCPStatusCapsLongSections(t *testing.T) {
 	)
 	if !strings.Contains(got, "+2 more resources") {
 		t.Fatalf("rendered MCP status should cap long resource sections:\n%s", got)
+	}
+}
+
+func TestRenderMCPStatusShowsQuarantinedTools(t *testing.T) {
+	got := renderMCPStatus(200,
+		[]plugin.ServerStatus{{
+			Name: "yakit", Transport: "stdio", Tools: 1,
+			ToolList: []plugin.ToolInfo{
+				{Name: "echo", Description: "available"},
+				{Name: "generate_yso_bytes", SchemaError: "invalid input schema: bad type at /properties/options/items/type"},
+			},
+		}},
+		nil,
+		nil,
+		nil,
+	)
+	for _, want := range []string{"1 tool", "1 unavailable tool", "unavailable tools", "generate_yso_bytes", "invalid input schema"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("rendered MCP status missing %q:\n%s", want, got)
+		}
 	}
 }
 

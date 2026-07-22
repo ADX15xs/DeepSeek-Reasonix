@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"reasonix/internal/proc"
+	"reasonix/internal/sandbox"
 	"reasonix/internal/secrets"
+	"reasonix/internal/tool"
 )
 
 const closeWaitBudget = 5 * time.Second
@@ -30,13 +32,15 @@ const closeWaitBudget = 5 * time.Second
 // callMu serialises a request/response round-trip over the shared pipe.
 type stdioTransport struct {
 	name   string
+	roots  []mcpRoot
 	cmd    *exec.Cmd
 	job    uintptr // Windows Job Object handle (0 elsewhere); reaps detached grandchildren on close
 	stdin  io.WriteCloser
 	stdout *bufio.Reader
 	stderr *tailBuffer
 
-	callMu sync.Mutex // one in-flight request/response at a time over the shared pipe
+	callMu  sync.Mutex // one in-flight request/response at a time over the shared pipe
+	writeMu sync.Mutex // client calls and server-request replies share stdin
 
 	mu      sync.Mutex
 	nextID  int
@@ -45,6 +49,7 @@ type stdioTransport struct {
 
 	waitOnce    sync.Once
 	releaseSlot func() // returns a bounded instance slot (e.g. CodeGraph) on close; nil when unbounded
+	progress    progressRouter
 }
 
 func newStdioTransport(ctx context.Context, s Spec) (*stdioTransport, error) {
@@ -71,7 +76,17 @@ func newStdioTransport(ctx context.Context, s Spec) (*stdioTransport, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, exe, s.Args...)
+	// A stateful stdio process cannot switch its OS sandbox after launch. Keep
+	// one process in the server's process sandbox; Plan and strict read-only
+	// checks still decide which tools may be dispatched over the shared transport.
+	processSandbox := s.Sandbox
+	processSandbox.MinimalWrites = true
+	processSandbox, env, err = prepareMCPPrivateState(s, processSandbox, env)
+	if err != nil {
+		return nil, err
+	}
+	argv, _ := sandbox.CommandArgs(processSandbox, append([]string{exe}, effectiveLaunchArgs(s)...))
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	proc.HideWindow(cmd)
 	if s.LowPriority {
 		proc.LowPriority(cmd)
@@ -103,6 +118,7 @@ func newStdioTransport(ctx context.Context, s Spec) (*stdioTransport, error) {
 	}
 	t := &stdioTransport{
 		name:        s.Name,
+		roots:       mcpRoots(s.WorkspaceRoot),
 		cmd:         cmd,
 		job:         job,
 		stdin:       stdin,
@@ -114,6 +130,52 @@ func newStdioTransport(ctx context.Context, s Spec) (*stdioTransport, error) {
 	releaseSlot = nil // ownership transferred to t; close() releases it
 	go t.readLoop()
 	return t, nil
+}
+
+func prepareMCPPrivateState(s Spec, processSandbox sandbox.Spec, env []string) (sandbox.Spec, []string, error) {
+	return prepareMCPPrivateStateForOS(s, processSandbox, env, runtime.GOOS)
+}
+
+func prepareMCPPrivateStateForOS(s Spec, processSandbox sandbox.Spec, env []string, goos string) (sandbox.Spec, []string, error) {
+	root := strings.TrimSpace(s.StateDir)
+	if root == "" {
+		return processSandbox, env, nil
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return processSandbox, env, err
+	}
+	privateRoot := root
+	cacheDir := filepath.Join(privateRoot, "cache")
+	stateDir := filepath.Join(privateRoot, "state")
+	dirs := []string{cacheDir, stateDir}
+	privateEnv := map[string]string{
+		"XDG_CACHE_HOME": cacheDir, "XDG_STATE_HOME": stateDir,
+		"npm_config_cache":      filepath.Join(cacheDir, "npm"),
+		"UV_CACHE_DIR":          filepath.Join(cacheDir, "uv"),
+		"BUN_INSTALL_CACHE_DIR": filepath.Join(cacheDir, "bun"),
+	}
+	if goos != "windows" {
+		tmpDir := filepath.Join(privateRoot, "tmp")
+		dirs = append(dirs, tmpDir)
+		privateEnv["TMP"] = tmpDir
+		privateEnv["TEMP"] = tmpDir
+		privateEnv["TMPDIR"] = tmpDir
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return processSandbox, env, err
+		}
+	}
+	// Windows stdio processes are currently unsandboxed and must keep the host's
+	// short temporary directory. Nesting TEMP below Reasonix's workspace-scoped
+	// state path can exceed the 108-byte Unix-domain-socket limit used by MCP
+	// servers such as MATLAB before their initialize response is written.
+	for key, value := range privateEnv {
+		env = setEnvValue(env, key, value)
+	}
+	processSandbox.WriteRoots = append(processSandbox.WriteRoots, root, privateRoot)
+	processSandbox.AppContainerWriteRoots = append(processSandbox.AppContainerWriteRoots, root, privateRoot)
+	return processSandbox, env, nil
 }
 
 var stdioShellPATH = cachedShellPATH(defaultStdioShellPATH)
@@ -449,40 +511,90 @@ func mergePathLists(primary, secondary string) string {
 	return strings.Join(out, string(os.PathListSeparator))
 }
 
+// stdioReplyQueueBound caps buffered server-request replies. The queue only
+// backs up while the reply writer is stuck behind a jammed stdin pipe, so a
+// small bound is plenty; overflow drops the reply instead of blocking readLoop.
+const stdioReplyQueueBound = 16
+
 // readLoop owns stdout for the transport's lifetime: it reads one JSON-RPC
-// message per line, drops server-initiated notifications/requests (they carry a
-// method), and hands each response to the call waiting on its id. On any read
-// error it fails every pending call and exits.
+// message per line, routes progress notifications, answers server requests, and
+// hands each response to the call waiting on its id. On any read error it fails
+// every pending call and exits.
 func (t *stdioTransport) readLoop() {
+	// Server-request replies go through replyLoop, never directly to stdin:
+	// readLoop is the only goroutine draining stdout, and blocking it on
+	// writeMu behind a client call whose own stdin write is jammed would
+	// deadlock both pipes once the server also blocks writing stdout.
+	replies := make(chan any, stdioReplyQueueBound)
+	defer close(replies)
+	go t.replyLoop(replies)
 	for {
-		line, err := t.stdout.ReadBytes('\n')
-		if err != nil {
-			t.failAll(err)
+		line, readErr := t.stdout.ReadBytes('\n')
+		line = bytes.TrimSpace(line)
+		if len(line) > 0 {
+			t.handleInboundLine(line, replies)
+		}
+		if readErr != nil {
+			t.failAll(readErr)
 			return
 		}
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
+	}
+}
+
+// replyLoop serialises server-request replies onto the shared stdin pipe. A
+// write failure is not terminal for the transport — the read side may still be
+// healthy, and pipe errors surface through the next client call's own write —
+// but it stops further replies and keeps draining so readLoop never blocks.
+func (t *stdioTransport) replyLoop(replies <-chan any) {
+	var dead bool
+	for msg := range replies {
+		if dead {
 			continue
 		}
-		var probe struct {
-			Method string `json:"method"`
-		}
-		_ = json.Unmarshal(line, &probe)
-		if probe.Method != "" {
-			continue // server notification/request, not a response to one of our calls
-		}
-		var resp rpcResponse
-		if err := json.Unmarshal(line, &resp); err != nil {
-			continue // unparseable line with no id — can't route it, skip
-		}
-		t.mu.Lock()
-		ch := t.pending[resp.ID]
-		delete(t.pending, resp.ID)
-		t.mu.Unlock()
-		if ch != nil {
-			ch <- resp // buffered(1): never blocks, even if the caller already left
+		if t.write(msg) != nil {
+			dead = true
 		}
 	}
+}
+
+func (t *stdioTransport) handleInboundLine(line []byte, replies chan<- any) {
+	probe, ok := decodeInboundMessage(line)
+	if !ok {
+		return // unparseable line cannot be routed; keep the transport alive
+	}
+	if probe.Method != "" {
+		if isNotificationID(probe.ID) {
+			if probe.Method == "notifications/progress" {
+				t.progress.dispatchProgress(probe.Params)
+			}
+			return
+		}
+		response := serverRequestReply(probe.ID, probe.Method, t.roots)
+		select {
+		case replies <- response:
+		default:
+			// The reply writer is stalled behind a full stdin pipe. An
+			// unanswered request degrades to the server's own timeout; a
+			// blocked readLoop could deadlock both pipes.
+		}
+		return
+	}
+
+	var resp rpcResponse
+	if err := json.Unmarshal(line, &resp); err != nil {
+		return
+	}
+	t.mu.Lock()
+	ch := t.pending[resp.ID]
+	delete(t.pending, resp.ID)
+	t.mu.Unlock()
+	if ch != nil {
+		ch <- resp // buffered(1): never blocks, even if the caller already left
+	}
+}
+
+func (t *stdioTransport) registerProgress(token string, sink tool.ProgressFunc) func() {
+	return t.progress.registerProgress(token, sink)
 }
 
 // failAll records the terminal read error and unblocks every pending call by
@@ -548,6 +660,8 @@ func (t *stdioTransport) write(v any) error {
 	if err != nil {
 		return err
 	}
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	if _, err = t.stdin.Write(append(b, '\n')); err != nil {
 		return t.withStderr(err)
 	}
