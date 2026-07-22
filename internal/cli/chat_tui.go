@@ -177,10 +177,6 @@ type chatTUI struct {
 	toolStreamStart time.Time
 	toolStreamFrame int
 	transcriptDirty bool
-	// First transcript line with stale wrapped output; -1 = clean.
-	wrapDirtyFrom int
-	// Visual rows per transcript line, used by wrapIncremental for splice offset.
-	lineWrapCounts []int
 	// forceGotoBottom is set by replayActiveBranch and resetFreshContextView to
 	// pin the viewport to the bottom after a session / branch / clear switch
 	// regardless of the previous wasAtBottom state (#4584).
@@ -306,15 +302,6 @@ type chatTUI struct {
 
 	// Terminal rows the status block occupies; used by bottomRows for height reservation.
 	statusLineCount int
-	// Status line cache fields
-	statusWorkingText string
-	statusLineText    string
-	dataLineText      string
-	statusWidth       int
-
-	// Cached panel row count to avoid double-rendering in bottomRows.
-	bottomPanelsRowsWidth int
-	bottomPanelsRows      int
 
 	// modelSwitchPending is true while any async controller rebuild is in flight.
 	modelSwitchPending bool
@@ -546,7 +533,6 @@ func newChatTUI(ctrl control.SessionAPI, missing string, eventCh chan event.Even
 		skills:               ctrl.SlashSkills(),
 		viewport:             viewport.New(viewport.WithWidth(termW)),
 		statusLineCount:      3,
-		wrapDirtyFrom:        -1,
 	}
 }
 
@@ -803,7 +789,6 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cm.forceGotoBottom = false
 	}
 	cm.transcriptDirty = false
-	cm.wrapDirtyFrom = -1 // ensure clean state after wrapping
 	// Any viewport scroll (wheel, PgUp/PgDn, edge auto-scroll, or tail-follow to
 	// newest output) shifts the whole window. Some terminals (Warp) mishandle
 	// the renderer's scroll/insert-line optimization and strand stale rows, so
@@ -1824,85 +1809,6 @@ func (m *chatTUI) commitLine(s string) {
 	m.appendTranscriptBlock(s, transcriptSource{kind: transcriptSourceFixed})
 }
 
-// markTranscriptDirty flags the wrapped-lines cache as stale starting from
-// fromIdx. When fromIdx < wrapDirtyFrom (or wrapDirtyFrom is clean), the dirty
-// range is extended downward so wrapIncremental re-wraps the minimum set.
-func (m *chatTUI) markTranscriptDirty(fromIdx int) {
-	m.transcriptDirty = true
-	if fromIdx < 0 {
-		fromIdx = 0
-	}
-	if m.wrapDirtyFrom < 0 || fromIdx < m.wrapDirtyFrom {
-		m.wrapDirtyFrom = fromIdx
-	}
-}
-
-// wrapAllLines re-wraps the entire transcript from scratch, rebuilding both
-// wrappedLines and lineWrapCounts. Used on width change, truncation, or cache
-// invalidation.
-func (m *chatTUI) wrapAllLines(contentW int) {
-	if len(m.transcript) == 0 {
-		m.wrappedLines = nil
-		m.lineWrapCounts = nil
-		m.wrapDirtyFrom = -1
-		return
-	}
-	// Pre-allocate: each transcript line yields at least 1 visual row.
-	m.wrappedLines = make([]string, 0, len(m.transcript))
-	m.lineWrapCounts = make([]int, len(m.transcript))
-	for i, line := range m.transcript {
-		wrapped := wrapTranscript(line, contentW)
-		lines := strings.Split(wrapped, "\n")
-		m.wrappedLines = append(m.wrappedLines, lines...)
-		m.lineWrapCounts[i] = len(lines)
-	}
-	m.wrapDirtyFrom = -1
-}
-
-// wrapIncremental re-wraps only the dirty tail of the transcript (from
-// wrapDirtyFrom to the end), splicing the result into the existing
-// wrappedLines. Falls back to wrapAllLines if the cache is inconsistent.
-func (m *chatTUI) wrapIncremental(contentW int) {
-	if m.wrapDirtyFrom < 0 {
-		return
-	}
-	// Fallback: full re-wrap on truncation.
-	if len(m.lineWrapCounts) > len(m.transcript) || m.lineWrapCounts == nil {
-		m.wrapAllLines(contentW)
-		return
-	}
-	// Appends: extend lineWrapCounts to match transcript length.
-	if len(m.lineWrapCounts) < len(m.transcript) {
-		m.lineWrapCounts = append(m.lineWrapCounts, make([]int, len(m.transcript)-len(m.lineWrapCounts))...)
-	}
-	if m.wrapDirtyFrom >= len(m.transcript) {
-		m.wrapDirtyFrom = -1
-		return
-	}
-	// Compute the visual-row offset of the first dirty transcript line.
-	offset := 0
-	for i := 0; i < m.wrapDirtyFrom; i++ {
-		offset += m.lineWrapCounts[i]
-	}
-	// Re-wrap from wrapDirtyFrom to end.
-	var newWrapped []string
-	for i := m.wrapDirtyFrom; i < len(m.transcript); i++ {
-		wrapped := wrapTranscript(m.transcript[i], contentW)
-		lines := strings.Split(wrapped, "\n")
-		newWrapped = append(newWrapped, lines...)
-		m.lineWrapCounts[i] = len(lines)
-	}
-	// Splice into wrappedLines, preserving the clean prefix.
-	if offset <= len(m.wrappedLines) {
-		m.wrappedLines = append(m.wrappedLines[:offset], newWrapped...)
-	} else {
-		// Offset mismatch (shouldn't happen): fall back to full wrap.
-		m.wrapAllLines(contentW)
-		return
-	}
-	m.wrapDirtyFrom = -1
-}
-
 // commitSpacer separates the next block (a thinking marker or a tool line) from
 // the previous one with a single blank line, skipping it at the top of the
 // transcript or when a blank already trails so spacers never double up.
@@ -1919,55 +1825,6 @@ func (m *chatTUI) commitSpacer() {
 // scrollback mode they join the bottom rail because there is no main viewport.
 func (m chatTUI) bottomRows() int {
 	rows := 0
-	if m.bottomPanelsRowsWidth > 0 && m.bottomPanelsRowsWidth == m.width {
-		// Use the cached panel row count populated by Update() via
-		// buildBottomPanelsRowCount. This avoids re-rendering every bottom
-		// panel here just to count newlines — View() still renders them for
-		// display, so the cache cuts the per-frame panel render count from
-		// two to one.
-		rows = m.bottomPanelsRows
-	} else {
-		// Fallback for tests / initial frame (before first Update).
-		for _, s := range []string{
-			m.renderTodoPanel(),
-			m.renderApprovalBanner(),
-			m.renderChooser(),
-			m.renderRewind(),
-			m.renderMCPImport(),
-			m.renderResumePicker(),
-			m.renderCopyPicker(),
-			m.renderCompletion(),
-		} {
-			if s != "" {
-				rows += strings.Count(s, "\n") + 1
-			}
-		}
-		if m.nativeScrollback {
-			if main := m.renderMainManager(); main != "" {
-				rows += strings.Count(main, "\n") + 1
-			}
-		}
-		if footer := m.renderMainManagerFooter(); footer != "" {
-			rows += strings.Count(footer, "\n") + 1
-		}
-	}
-	if !m.hideComposer() {
-		rows += m.input.Height() + 2
-	}
-	if m.statusLineCount > 0 {
-		return rows + m.statusLineCount
-	}
-	return rows + 2 // fallback for tests that don't set statusLineCount
-}
-
-// buildBottomPanelsRowCount renders every bottom panel once and caches the
-// total row count. Update() calls this after state has settled so bottomRows()
-// can read m.bottomPanelsRows instead of re-rendering each panel for line
-// counting. The pointer receiver is fine — Update() holds an addressable
-// local copy of chatTUI.
-func (m *chatTUI) buildBottomPanelsRowCount() {
-	m.bottomPanelsRowsWidth = m.width
-	rows := 0
 	for _, s := range []string{
 		m.renderTodoPanel(),
 		m.renderApprovalBanner(),
@@ -1975,7 +1832,6 @@ func (m *chatTUI) buildBottomPanelsRowCount() {
 		m.renderRewind(),
 		m.renderMCPImport(),
 		m.renderResumePicker(),
-		m.renderQuickPicker(),
 		m.renderCopyPicker(),
 		m.renderCompletion(),
 	} {
@@ -1991,7 +1847,13 @@ func (m *chatTUI) buildBottomPanelsRowCount() {
 	if footer := m.renderMainManagerFooter(); footer != "" {
 		rows += strings.Count(footer, "\n") + 1
 	}
-	m.bottomPanelsRows = rows
+	if !m.hideComposer() {
+		rows += m.input.Height() + 2
+	}
+	if m.statusLineCount > 0 {
+		return rows + m.statusLineCount
+	}
+	return rows + 2 // fallback for tests that don't set statusLineCount
 }
 
 // hideComposer is the single ownership gate for the bottom composer.
@@ -2246,7 +2108,7 @@ func (m *chatTUI) streamToolOutput(id, chunk string) {
 		lines[i] = dim(clampPlain(ln, m.width-len([]rune(connector))))
 	}
 	m.transcript[m.toolStreamIdx] = connectorBlock(lines)
-	m.markTranscriptDirty(m.toolStreamIdx)
+	m.transcriptDirty = true
 }
 
 // pushToolLine appends a completed output line to the bounded tail, dropping the
@@ -2338,7 +2200,7 @@ func (m *chatTUI) collapseToolOutput(id, resultOutput string) {
 // sources, in order: live streaming state, shellOutputs ("shell-" ids only),
 // the per-id count stashed by streamToolOutput, then the ToolResult's output.
 func (m *chatTUI) collapseShellSlot(id string, idx int, resultOutput string) {
-	m.markTranscriptDirty(idx)
+	m.transcriptDirty = true
 	n := -1
 	if id == m.toolStreamID {
 		// Prefer the larger of the live count and resultOutput: resultOutput
@@ -2452,7 +2314,7 @@ func (m *chatTUI) toggleShellOutput() {
 		}
 		m.transcript[lastIdx] = connectorBlock(rendered)
 	}
-	m.markTranscriptDirty(lastIdx)
+	m.transcriptDirty = true
 	if m.nativeScrollback {
 		m.commitLine(m.transcript[lastIdx])
 	}
@@ -2506,7 +2368,7 @@ func (m *chatTUI) tickToolRunning() {
 	frame := toolWorkingFrames[m.toolStreamFrame%len(toolWorkingFrames)]
 	secs := int(time.Since(m.toolStreamStart).Seconds())
 	m.transcript[m.toolStreamIdx] = connectorBlock([]string{dim(fmt.Sprintf(i18n.M.ChatToolWorkingFmt, frame, secs))})
-	m.markTranscriptDirty(m.toolStreamIdx)
+	m.transcriptDirty = true
 }
 
 // commitReasoning closes the live thinking block: the "▎ thinking…" marker is
@@ -2544,14 +2406,7 @@ func (m *chatTUI) commitReasoning() {
 			m.removeTranscriptBlock(m.reasoningTextIdx)
 		}
 	}
-	// The reasoning line index is the earlier of reasoningLineIdx/reasoningTextIdx;
-	// if a line was removed (append-shift above), all subsequent indices shift,
-	// so mark dirty from the earlier index for a correct incremental re-wrap.
-	dirtyFrom := m.reasoningLineIdx
-	if m.reasoningTextIdx >= 0 && m.reasoningTextIdx < dirtyFrom {
-		dirtyFrom = m.reasoningTextIdx
-	}
-	m.markTranscriptDirty(dirtyFrom)
+	m.transcriptDirty = true
 	m.reasoning.Reset()
 	m.reasoningView = m.reasoningView[:0]
 	m.reasoningLineIdx = -1

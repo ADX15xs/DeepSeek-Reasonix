@@ -39,7 +39,6 @@ func newTestChatTUI() chatTUI {
 		shellExpanded:        shellExp,
 		shellTranscriptIdx:   shellIdx,
 		toolLineCountByID:    map[string]int{},
-		wrapDirtyFrom:        -1,
 	}
 }
 
