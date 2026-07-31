@@ -40,7 +40,7 @@ func pastedPathCandidates(src, goos string, shellDecoded bool) []string {
 	if goos == "windows" {
 		if quoted {
 			add(inner)
-		} else if !hasUnescapedPathWhitespace(src) {
+		} else if looksLikeWindowsPath(src) {
 			add(src)
 		}
 	}
@@ -139,6 +139,18 @@ func normalizeWindowsPOSIXPath(src string) string {
 		return strings.ToUpper(src[len(cygdrive):len(cygdrive)+1]) + ":" + src[len(cygdrive)+1:]
 	}
 	return src
+}
+
+func looksLikeWindowsPath(src string) bool {
+	if strings.HasPrefix(src, `\\`) {
+		return true
+	}
+	// Drive-relative paths (C:sub\file) are intentionally out of scope: they
+	// resolve against the drive's current directory, not a supported paste shape.
+	if len(src) >= 3 && isASCIIAlpha(src[0]) && src[1] == ':' && (src[2] == '\\' || src[2] == '/') {
+		return true
+	}
+	return false
 }
 
 // unescapeWindowsShellPath keeps likely native separator backslashes while

@@ -342,6 +342,23 @@ func TestPastedImageSources(t *testing.T) {
 	}
 }
 
+func TestPastedImageSourcesWindowsMultiPathPreservesBackslashes(t *testing.T) {
+	// Regression guard: a Bash field split strips the backslashes in
+	// "C:\a.png C:\b.png" (-> C:a.png) and silently fails the attachment.
+	sources, ok := pastedImageSourcesForOS(`C:\a.png C:\b.png`, "windows")
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	got := make([]string, 0, len(sources))
+	for _, s := range sources {
+		got = append(got, s.value)
+	}
+	want := []string{`C:\a.png`, `C:\b.png`}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sources = %v, want %v (backslashes must be preserved)", got, want)
+	}
+}
+
 func TestPasteShellEscapedImagePathInsertsImageToken(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell-escaped paths are not decoded on Windows")
@@ -508,10 +525,11 @@ func TestPastedImagePathShellUnescape(t *testing.T) {
 			ok:   true,
 		},
 		{
-			name: "windows unquoted space rejected",
+			name: "windows unquoted space accepted",
 			src:  `C:\Program Files\shot.png`,
 			goos: "windows",
-			ok:   false,
+			want: `C:\Program Files\shot.png`,
+			ok:   true,
 		},
 		{
 			name: "windows quoted path with space preserved",

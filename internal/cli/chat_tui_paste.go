@@ -474,21 +474,34 @@ func pastedImageSourcesForOS(text, goos string) ([]pastedImageSource, bool) {
 	lines := nonEmptyPasteLines(trimmed)
 	lineSources := rawPastedImageSources(lines)
 	if len(lines) > 0 && allImageSources(lineSources, goos) {
+		if len(lines) == 1 {
+			// Try a backslash-preserving split first so native Windows paths
+			// (C:\a.png C:\b.png) keep their separators; a Bash field split would
+			// strip them into non-existent drive-relative paths. Fall back to the
+			// Bash split to decode shell quoting/escaping (e.g. C:/.../first" image".png)
+			// it can't.
+			if fields := splitPastePathTokens(lines[0]); len(fields) > 1 {
+				fieldSources := rawPastedImageSources(fields)
+				if allImageSources(fieldSources, goos) {
+					return fieldSources, true
+				}
+			}
+			if staticFields, malformed := shellparse.StaticFields(lines[0]); malformed == "" && len(staticFields) > 1 {
+				shellSources := make([]pastedImageSource, 0, len(staticFields))
+				for _, field := range staticFields {
+					shellSources = append(shellSources, pastedImageSource{value: field, shellDecoded: true})
+				}
+				if allImageSources(shellSources, goos) {
+					return shellSources, true
+				}
+			}
+		}
 		return lineSources, true
 	}
 	fields := splitPastePathTokens(trimmed)
 	fieldSources := rawPastedImageSources(fields)
 	if len(fields) > 1 && allImageSources(fieldSources, goos) {
 		return fieldSources, true
-	}
-	if staticFields, malformed := shellparse.StaticFields(trimmed); malformed == "" && len(staticFields) > 1 {
-		sources := make([]pastedImageSource, 0, len(staticFields))
-		for _, field := range staticFields {
-			sources = append(sources, pastedImageSource{value: field, shellDecoded: true})
-		}
-		if allImageSources(sources, goos) {
-			return sources, true
-		}
 	}
 	return nil, false
 }
