@@ -113,6 +113,15 @@ var (
 	terminalProbe         = queryTerminalBackground
 )
 
+// Cached theme styles — refreshed on each theme change via refreshCLIStyles.
+var (
+	themeDangerStyle lipgloss.Style
+	themeWarnStyle   lipgloss.Style
+	// Cached queue indicator styles
+	queueStyle          lipgloss.Style
+	queueHighlightStyle lipgloss.Style
+)
+
 func noTerminalBackground() (terminalRGB, bool) { return terminalRGB{}, false }
 
 // cliCursorShape is the active cursor shape for the textarea input, configured

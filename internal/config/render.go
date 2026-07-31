@@ -757,11 +757,11 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 				b.WriteString("# Raw MCP tool names with per-tool call timeouts.\n")
 				fmt.Fprintf(&b, "tool_timeout_seconds = %s\n", renderIntMap(pl.ToolTimeoutSeconds))
 			}
-		if len(pl.DisabledTools) > 0 {
-			b.WriteString("# Raw MCP tool names to exclude from registration.\n")
-			fmt.Fprintf(&b, "disabled_tools = %s\n", renderStringArray(pl.DisabledTools))
-		}
-		if pl.AutoStart != nil {
+			if len(pl.DisabledTools) > 0 {
+				b.WriteString("# Raw MCP tool names to exclude from registration.\n")
+				fmt.Fprintf(&b, "disabled_tools = %s\n", renderStringArray(pl.DisabledTools))
+			}
+			if pl.AutoStart != nil {
 				fmt.Fprintf(&b, "auto_start = %v\n", *pl.AutoStart)
 			}
 		}

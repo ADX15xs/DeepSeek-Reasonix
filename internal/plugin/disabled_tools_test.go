@@ -101,28 +101,28 @@ func TestIsToolDisabledNilAndEmpty(t *testing.T) {
 	}
 }
 
-// TestSpecFingerprintNilVsEmptyDisabledTools verifies that nil and empty
-// DisabledTools produce the same SpecFingerprint, preserving backward
+// TestSchemaCacheKeyNilVsEmptyDisabledTools verifies that nil and empty
+// DisabledTools produce the same SchemaCacheKey, preserving backward
 // compatibility with caches written before DisabledTools existed.
-func TestSpecFingerprintNilVsEmptyDisabledTools(t *testing.T) {
+func TestSchemaCacheKeyNilVsEmptyDisabledTools(t *testing.T) {
 	sNil := Spec{Name: "s", Type: "stdio", Command: "cmd", DisabledTools: nil}
 	sEmpty := Spec{Name: "s", Type: "stdio", Command: "cmd", DisabledTools: map[string]bool{}}
 
-	hNil := SpecFingerprint(sNil)
-	hEmpty := SpecFingerprint(sEmpty)
+	hNil := SchemaCacheKey(sNil)
+	hEmpty := SchemaCacheKey(sEmpty)
 
 	if hNil != hEmpty {
-		t.Fatalf("SpecFingerprint(nil) = %q, SpecFingerprint(empty) = %q, want equal", hNil, hEmpty)
+		t.Fatalf("SchemaCacheKey(nil) = %q, SchemaCacheKey(empty) = %q, want equal", hNil, hEmpty)
 	}
 }
 
-// TestSpecFingerprintWithoutDisabledTools verifies that a Spec with no
-// DisabledTools field produces the same fingerprint as an older Spec struct
+// TestSchemaCacheKeyWithoutDisabledTools verifies that a Spec with no
+// DisabledTools field produces the same key as an older Spec struct
 // that never had the field (backward-compatibility guard).
-func TestSpecFingerprintWithoutDisabledTools(t *testing.T) {
+func TestSchemaCacheKeyWithoutDisabledTools(t *testing.T) {
 	// This spec deliberately omits DisabledTools (zero-value nil).
 	s := Spec{Name: "my-server", Type: "stdio", Command: "/usr/bin/example", Args: []string{"--flag", "x"}, Env: map[string]string{"FOO": "1", "BAR": "2"}, Headers: map[string]string{"X-Custom": "ok"}, Dir: "/work"}
-	_ = SpecFingerprint(s) // must not panic; value not validated, only that it runs without the field
+	_ = SchemaCacheKey(s) // must not panic; value not validated, only that it runs without the field
 }
 
 // TestLazyToolsetCacheHitFiltersDisabledTools verifies that the cache-hit
@@ -134,7 +134,7 @@ func TestLazyToolsetCacheHitFiltersDisabledTools(t *testing.T) {
 		DisabledTools: map[string]bool{"a": true},
 	}
 	cs := &CachedSchema{
-		SpecHash: SpecFingerprint(spec),
+		CacheKey: SchemaCacheKey(spec),
 		Tools: []CachedTool{
 			{Name: "a", Description: "disabled tool"},
 			{Name: "b", Description: "kept tool"},
@@ -156,22 +156,23 @@ func TestLazyToolsetCacheHitFiltersDisabledTools(t *testing.T) {
 	}
 }
 
-// TestCacheInvalidatesWhenDisabledToolsChanges verifies that SpecFingerprint
-// changes when DisabledTools is modified, forcing a cache miss.
-func TestCacheInvalidatesWhenDisabledToolsChanges(t *testing.T) {
+// TestDisabledToolsDoesNotAffectCacheKey verifies that changing DisabledTools
+// does NOT invalidate the schema cache. DisabledTools is a runtime filter, not
+// a server identity parameter, so the cached schema is still valid.
+func TestDisabledToolsDoesNotAffectCacheKey(t *testing.T) {
 	redirectCache(t)
 
 	spec := sampleSpec()
 	spec.DisabledTools = map[string]bool{"write_file": true}
-	hash := SpecFingerprint(spec)
-	if err := SaveCachedSchema(spec.Name, sampleCachedSchema(hash)); err != nil {
+	key := SchemaCacheKey(spec)
+	if err := SaveCachedSchema(spec.Name, sampleCachedSchema(key)); err != nil {
 		t.Fatalf("SaveCachedSchema: %v", err)
 	}
 
-	// Change DisabledTools — should produce a different hash.
+	// Change DisabledTools — cache key should be identical, so cache hit.
 	changed := sampleSpec()
 	changed.DisabledTools = map[string]bool{"delete_file": true}
-	if _, ok := LoadCachedSchema(spec.Name, SpecFingerprint(changed)); ok {
-		t.Fatal("LoadCachedSchema: hit after DisabledTools changed")
+	if _, ok := LoadCachedSchema(spec.Name, SchemaCacheKey(changed)); !ok {
+		t.Fatal("LoadCachedSchema: expected hit when only DisabledTools changed")
 	}
 }
