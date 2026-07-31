@@ -7,7 +7,7 @@ import { createRoot } from "react-dom/client";
 import gsap from "gsap";
 import { ApprovalModal } from "../components/ApprovalModal";
 import { activeFileReferenceToken, pickInlineFileReference } from "../components/FileReferenceMenu";
-import { LocaleProvider } from "../lib/i18n";
+import { LocaleProvider, preloadDetectedLocale } from "../lib/i18n";
 import type { AppBindings } from "../lib/bridge";
 import type { WireApproval } from "../lib/types";
 
@@ -95,6 +95,7 @@ function mockApp(methods: Partial<AppBindings>) {
 }
 
 async function renderApproval(props: Partial<Parameters<typeof ApprovalModal>[0]> = {}) {
+  await preloadDetectedLocale();
   const rootEl = document.getElementById("root");
   if (!rootEl) throw new Error("missing root");
   const root = createRoot(rootEl);
@@ -322,6 +323,70 @@ console.log("\napproval modal file references");
   ok(text.includes("在计划模式中信任 \"gh issue view\" 为只读命令前缀"), "plan-mode read-only command approval localizes subject in Chinese UI");
   ok(text.includes("不在 Reasonix 内置只读集合中"), "plan-mode read-only command approval localizes reason in Chinese UI");
 
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom("zh-CN");
+  mockApp({
+    ListDir: async () => [],
+    SearchFileRefs: async () => [],
+  });
+  const { root } = await renderApproval({
+    approval: {
+      id: "dynamic-bash-zh",
+      tool: "bash",
+      subject: "python3 -c \"print('hello')\"",
+      reason: "Matched permission rule: ask Bash(python3:*)\nThis command uses nested or indirect shell execution. Auto and broad allow rules cannot verify the inner command; approve this exact command or use YOLO.",
+    },
+  });
+
+  const text = document.body.textContent ?? "";
+  ok(text.includes("命中权限规则：ask Bash(python3:*)"), "approval identifies the exact matched permission rule");
+  ok(text.includes("嵌套或间接执行"), "dynamic Bash approval explains the matched safety boundary in Chinese");
+  ok(text.includes("精确命令"), "dynamic Bash approval tells the user how to grant the command");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  mockApp({
+    ListDir: async () => [],
+    SearchFileRefs: async () => [],
+  });
+  const { root, rerender } = await renderApproval();
+
+  await clickImmediateAction("Revise plan");
+
+  const textarea = document.querySelector(".plan-revision__input") as HTMLTextAreaElement | null;
+  if (!textarea) throw new Error("plan revision textarea did not render");
+  ok(textarea === document.activeElement, "opening plan revision focuses its textarea once");
+
+  const transcriptText = document.createElement("p");
+  transcriptText.tabIndex = -1;
+  transcriptText.textContent = "copy this plan text";
+  document.body.appendChild(transcriptText);
+  transcriptText.focus();
+  const range = document.createRange();
+  range.selectNodeContents(transcriptText);
+  const selection = document.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+
+  // App refreshes tab metadata periodically; emulate callback churn from a parent rerender.
+  await rerender({ onRevisionActiveChange: () => undefined });
+
+  ok(document.activeElement === transcriptText, "parent rerender does not return focus to plan revision");
+  eq(document.getSelection()?.toString(), "copy this plan text", "parent rerender preserves transcript text selection");
+
+  transcriptText.remove();
   await act(async () => {
     root.unmount();
   });

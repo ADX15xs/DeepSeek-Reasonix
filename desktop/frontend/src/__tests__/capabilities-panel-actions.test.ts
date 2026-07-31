@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import React from "react";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { MCPServersSettingsPage, PluginsSettingsPage, failureKind, mcpServerDraftJSON, parseMCPServerJSON, summarizeServerError, withExplicitMCPClears } from "../components/CapabilitiesPanel";
+import { MCPServersSettingsPage, PluginsSettingsPage, failureKind, mcpServerDraftJSON, parseMCPQuickDefinition, parseMCPServerJSON, summarizeServerError, withExplicitMCPClears } from "../components/CapabilitiesPanel";
 import { slashCommandGroup, slashCommandKindTag, sortSlashCommandsForMenu } from "../components/SlashMenu";
 import { selectToolsOnFirstCustomUse } from "../components/SubagentsPanel";
 import type { AppBindings } from "../lib/bridge";
@@ -81,6 +81,12 @@ function ok(value: unknown, message: string) {
           }];
           return 1;
         },
+        InstallMCPServer: async (input) => {
+          const app = window.go?.main?.App;
+          if (!app) throw new Error("missing App bindings");
+          const toolCount = await app.AddMCPServer(input);
+          return { name: input.name, state: "ready", toolCount, action: "none", message: "ready" };
+        },
       } as Partial<AppBindings> as AppBindings,
     },
   };
@@ -124,6 +130,19 @@ function ok(value: unknown, message: string) {
   });
   dom.window.close();
 }
+
+const quickCommand = parseMCPQuickDefinition("npx -y chrome-devtools-mcp@latest");
+ok(quickCommand.name === "chrome-devtools-mcp" && quickCommand.transport === "stdio", "quick install should derive a stable name and stdio transport from one command");
+
+const quickFilesystem = parseMCPQuickDefinition('npx -y @modelcontextprotocol/server-filesystem "/srv/shared data"');
+ok(quickFilesystem.name === "server-filesystem", "quick install name should come from the launcher package, not a trailing server argument");
+
+const quickPythonModule = parseMCPQuickDefinition("python -m mcp_server_time --local-timezone=UTC");
+ok(quickPythonModule.name === "mcp-server-time", "python module quick install should derive its name from the module");
+const quickURL = parseMCPQuickDefinition("https://mcp.linear.app/mcp");
+ok(quickURL.name === "mcp" && quickURL.transport === "http", "quick install should derive HTTP transport from a URL");
+const quickJSON = parseMCPQuickDefinition(JSON.stringify({ custom: { command: "uvx", args: ["demo-mcp"] } }));
+ok(quickJSON.name === "custom" && quickJSON.args[0] === "demo-mcp", "quick install should preserve advanced JSON definitions");
 
 const completeMCPJSON = JSON.stringify({
   admin: {
@@ -267,7 +286,8 @@ const failed = mcpServerLifecycleActions({ ...server("failed"), runtimeState: "i
 ok(failed.showRetryInRow, "failed server row should expose retry");
 
 ok(mcpServerRetryableFromAvailableList(server("initializing")), "connecting server should be included in available-list retry all");
-ok(mcpServerRetryableFromAvailableList({ ...server("deferred"), startIntent: "automatic" }), "automatic idle server should be included in available-list retry all");
+ok(!mcpServerRetryableFromAvailableList({ ...server("deferred"), startIntent: "automatic" }), "healthy on-demand server should not be included in retry all");
+ok(mcpServerRetryableFromAvailableList({ ...server("deferred"), startIntent: "automatic", action: "retry" }), "explicit retry action should remain available for an idle server");
 ok(!mcpServerRetryableFromAvailableList(server("connected")), "connected server should be excluded from available-list retry all");
 ok(!mcpServerRetryableFromAvailableList({ ...server("disabled"), startIntent: "off" }), "disabled server should be excluded from available-list retry all");
 ok(!mcpServerRetryableFromAvailableList({ ...server("failed"), runtimeState: "issue" }), "failed server is handled by the failure banner retry all");
@@ -334,17 +354,6 @@ function setInputValue(input: HTMLInputElement, value: string) {
   const eventCtor = win?.Event ?? Event;
   input.dispatchEvent(new eventCtor("input", { bubbles: true }));
   input.dispatchEvent(new eventCtor("change", { bubbles: true }));
-}
-
-function setTextareaValue(textarea: HTMLTextAreaElement, value: string) {
-  const win = textarea.ownerDocument.defaultView;
-  const previous = textarea.value;
-  const setter = Object.getOwnPropertyDescriptor((win?.HTMLTextAreaElement ?? HTMLTextAreaElement).prototype, "value")?.set;
-  setter?.call(textarea, value);
-  (textarea as HTMLTextAreaElement & { _valueTracker?: { setValue: (next: string) => void } })._valueTracker?.setValue(previous);
-  const eventCtor = win?.Event ?? Event;
-  textarea.dispatchEvent(new eventCtor("input", { bubbles: true }));
-  textarea.dispatchEvent(new eventCtor("change", { bubbles: true }));
 }
 
 ok(
@@ -473,24 +482,35 @@ console.log("capabilities panel MCP actions");
     active: true,
     cwd: "/tmp/reasonix-test",
   }];
-  let projectAuthorizationCount = 0;
   let servers: ServerView[] = [{
     name: "github",
     transport: "stdio",
-    status: "failed",
-    runtimeState: "issue",
+    status: "connected",
+    runtimeState: "ready",
     configured: true,
+    source: "project",
+    configSource: "reasonix.toml",
     autoStart: true,
-    tools: 0,
+    tools: 3,
     prompts: 0,
     resources: 0,
-    error: "project-provided MCP server is blocked until the user authorizes it",
-    requiresLaunchApproval: true,
     toolList: [
       { name: "issue_read", description: "Read issues.", readOnlyHint: true },
       { name: "issue_write", description: "Write issues." },
       { name: "wipe", description: "Delete data.", destructiveHint: true },
     ],
+  }, {
+    name: "linear",
+    transport: "http",
+    status: "connected",
+    runtimeState: "ready",
+    configured: true,
+    source: "user",
+    autoStart: true,
+    tools: 1,
+    prompts: 0,
+    resources: 0,
+    toolList: [{ name: "get_issue", description: "Read an issue.", readOnlyHint: true }],
   }];
   window.go = {
     main: {
@@ -498,16 +518,6 @@ console.log("capabilities panel MCP actions");
         Meta: async () => meta,
         ListTabs: async () => tabs,
         MCPServers: async () => servers,
-        AuthorizeAndConnectMCPServer: async () => {
-          projectAuthorizationCount += 1;
-          servers = servers.map((item) => ({
-            ...item,
-            status: "connected",
-            runtimeState: "ready",
-            requiresLaunchApproval: false,
-            error: "",
-          }));
-        },
       } as Partial<AppBindings> as AppBindings,
     },
   };
@@ -524,16 +534,17 @@ console.log("capabilities panel MCP actions");
       await flush();
     });
   };
-  await waitFor("project MCP authorization action", () => Boolean(findButton("Authorize and connect")));
-  ok(!findButton("Review changes"), "project MCP launch approval has no separate change-review workflow");
+  await waitFor("trusted project MCP", () => Boolean(document.querySelector('[data-status="connected"]')));
+  ok(document.body.textContent?.includes("This project"), "project MCP is grouped under This project");
+  ok(document.body.textContent?.includes("Global MCP"), "user-installed MCP is grouped by its global scope");
+  ok(document.body.textContent?.includes("Install once and use automatically in every Reasonix project."), "global MCP explains its cross-project availability");
+  ok(document.body.textContent?.includes("Project"), "project MCP row shows a project source badge");
+  ok(document.body.textContent?.includes("Declared by this project and available automatically."), "project MCP explains zero-confirmation availability");
+  ok(!findButton("Install and use"), "trusted project MCP has no install confirmation");
+  ok(!findButton("Authorize and connect"), "trusted project MCP has no authorization action");
+  ok(!findButton("Review changes"), "project MCP has no separate change-review workflow");
   ok(!findButton("Refresh catalog"), "catalog maintenance is not part of the normal MCP workflow");
-  ok(!document.querySelector('[role="dialog"]'), "project authorization does not open a second modal");
-  await act(async () => {
-    findButton("Authorize and connect")?.click();
-    await flush();
-  });
-  await waitFor("durable project launch authorization", () => projectAuthorizationCount === 1 && Boolean(document.querySelector('[data-status="connected"]')));
-  ok(!document.querySelector('[role="dialog"]'), "project confirmation connects directly without a second modal");
+  ok(!document.querySelector('[role="dialog"]'), "project MCP does not open a confirmation modal");
 
   servers = servers.map((item) => ({
     ...item,
@@ -567,13 +578,14 @@ console.log("capabilities panel MCP actions");
     requiresLaunchApproval: false,
   }));
   await refreshStatus();
-  await waitFor("authorized project server row", () => Boolean(document.querySelector('[data-status="connected"]')));
+  await waitFor("trusted project server row", () => Boolean(document.querySelector('[data-status="connected"]')));
   await act(async () => {
     (document.querySelector(".cap-mcp-list-row__main") as HTMLButtonElement | null)?.click();
     await flush();
   });
   await waitFor("connected project server detail", () => Boolean(document.querySelector(".cap-mcp-subpage")));
-  ok(!findButton("Review changes"), "an authorized connected project server does not show a change alarm");
+  ok(document.body.textContent?.includes("Current project · reasonix.toml"), "project MCP details show their configuration source");
+  ok(!findButton("Review changes"), "a trusted connected project server does not show a change alarm");
   ok(!findButton("Revoke trust"), "normal MCP details do not expose a second authorization-management workflow");
 
   await act(async () => {
@@ -787,6 +799,23 @@ console.log("capabilities panel MCP actions");
           }];
           return 0;
         },
+        InstallMCPServer: async (input: MCPServerInput) => {
+          addedInput = input;
+          servers = [...servers, {
+            name: input.name,
+            transport: input.transport,
+            status: "connected",
+            configured: true,
+            autoStart: true,
+            command: input.command,
+            args: input.args,
+            url: input.url,
+            tools: 0,
+            prompts: 0,
+            resources: 0,
+          }];
+          return { name: input.name, state: "ready", toolCount: 0, action: "none", message: "ready" };
+        },
       } as Partial<AppBindings> as AppBindings,
     },
   };
@@ -812,94 +841,18 @@ console.log("capabilities panel MCP actions");
     addServer.click();
     await flush();
   });
-  const advanced = findButton("Advanced options");
-  if (!advanced) throw new Error("missing Advanced options button");
-  ok(advanced.getAttribute("aria-expanded") === "false", "new server advanced options are collapsed by default");
-  ok(!document.querySelector(".cap-mcp-advanced__body"), "collapsed advanced options keep environment fields out of the initial form");
-
-  const jsonMode = findButton("JSON");
-  if (!jsonMode) throw new Error("missing JSON editor mode");
+  const quickInstall = findButton("Quick install");
+  const manualSetup = findButton("Manual setup");
+  ok(quickInstall?.getAttribute("aria-selected") === "true" && Boolean(manualSetup) && Boolean(findButton("JSON")), "new server install defaults to quick install while keeping manual and JSON configuration in the same editor");
+  const definitionEditor = document.querySelector<HTMLTextAreaElement>(".cap-mcp-quick__input");
+  if (!definitionEditor) throw new Error("missing quick MCP install input");
+  ok(definitionEditor.placeholder.includes("chrome-devtools-mcp@latest"), "the default install path asks only for a command, URL, or JSON definition");
   await act(async () => {
-    jsonMode.click();
+    manualSetup?.click();
     await flush();
   });
-  const initialJSONEditor = document.querySelector<HTMLTextAreaElement>(".cap-mcp-json-editor__input");
-  if (!initialJSONEditor) throw new Error("missing MCP JSON editor");
-  await act(async () => {
-    findButton("Form")?.click();
-    await flush();
-  });
-  ok(Boolean(document.querySelector(".cap-mcp-form-grid")), "the untouched empty MCP template can switch back to the form editor");
-  ok(document.querySelector<HTMLInputElement>(".cap-mcp-field--name input")?.value === "", "returning from the untouched template preserves the empty server name");
-  await act(async () => {
-    findButton("JSON")?.click();
-    await flush();
-  });
-  const incompleteJSONEditor = document.querySelector<HTMLTextAreaElement>(".cap-mcp-json-editor__input");
-  if (!incompleteJSONEditor) throw new Error("missing MCP JSON editor after returning from the empty form");
-  await act(async () => {
-    setTextareaValue(incompleteJSONEditor, JSON.stringify({ "yakit-next": { type: "stdio", command: "" } }, null, 2));
-    await flush();
-  });
-  await act(async () => {
-    findButton("Form")?.click();
-    await flush();
-  });
-  ok(Boolean(document.querySelector(".cap-mcp-form-grid")), "an incomplete but structured MCP draft can switch back to the form editor");
-  ok(document.querySelector<HTMLInputElement>(".cap-mcp-field--name input")?.value === "yakit-next", "switching an incomplete JSON draft preserves its server name");
-  await act(async () => {
-    findButton("JSON")?.click();
-    await flush();
-  });
-  const invalidJSONEditor = document.querySelector<HTMLTextAreaElement>(".cap-mcp-json-editor__input");
-  if (!invalidJSONEditor) throw new Error("missing MCP JSON editor after incomplete draft round trip");
-  await act(async () => {
-    setTextareaValue(invalidJSONEditor, "{");
-    await flush();
-  });
-  await act(async () => {
-    findButton("Add and connect")?.click();
-    await flush();
-  });
-  ok(document.querySelector('[role="alert"]')?.textContent?.includes("Enter valid JSON") ?? false, "invalid MCP JSON shows a focused validation error");
-  ok(!addedInput, "invalid MCP JSON does not call AddMCPServer");
-
-  const validJSON = JSON.stringify({
-    mcpServers: {
-      "yakit-next": {
-        command: "npx",
-        args: ["-y", "@yaklang/mcp", "hello world"],
-        env: { TOKEN: "test-token" },
-      },
-    },
-  }, null, 2);
-  await act(async () => {
-    setTextareaValue(invalidJSONEditor, validJSON);
-    await flush();
-  });
-  await act(async () => {
-    findButton("Form")?.click();
-    await flush();
-  });
-  ok(Boolean(document.querySelector(".cap-mcp-form-grid")), "valid MCP JSON can switch back to the form editor");
-  await act(async () => {
-    findButton("JSON")?.click();
-    await flush();
-  });
-  const roundTripJSONEditor = document.querySelector<HTMLTextAreaElement>(".cap-mcp-json-editor__input");
-  if (!roundTripJSONEditor) throw new Error("missing MCP JSON editor after round trip");
-  const roundTripped = JSON.parse(roundTripJSONEditor.value) as Record<string, { args?: string[] }>;
-  ok(roundTripped["yakit-next"]?.args?.[2] === "hello world", "form and JSON mode round trip preserves structured MCP arguments");
-  await act(async () => {
-    findButton("Add and connect")?.click();
-    await flush();
-  });
-  await waitFor("AddMCPServer call", () => Boolean(addedInput));
-  ok(addedInput?.name === "yakit-next", "valid MCP JSON passes the server name to AddMCPServer");
-  ok(addedInput?.command === "npx", "valid MCP JSON keeps the executable separate from its arguments");
-  ok(addedInput?.args?.[2] === "hello world", "valid MCP JSON passes structured arguments to AddMCPServer");
-  ok(addedInput?.env?.TOKEN === "test-token", "valid MCP JSON passes environment variables to AddMCPServer");
-  ok(!document.querySelector('[role="dialog"]'), "adding a user MCP server does not open a second authorization prompt");
+  ok(Boolean(document.querySelector(".cap-mcp-field--name input")) && Boolean(findButton("Advanced options")), "manual setup restores name, transport, and advanced configuration without leaving the install page");
+  ok(!addedInput, "opening the quick installer does not mutate MCP state");
 
   await act(async () => {
     root.unmount();

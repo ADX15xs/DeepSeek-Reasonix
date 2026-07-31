@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/colorprofile"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -967,6 +969,11 @@ func TestApprovalChoicesPreserveDecisionSemantics(t *testing.T) {
 			tool: control.SandboxEscapeApprovalTool,
 			want: []approvalChoice{{allow: true}, {allow: true, allowForSession: true}, {}},
 		},
+		{
+			name: "plan decision",
+			tool: planApprovalTool,
+			want: []approvalChoice{{allow: true}, {}, {exitPlan: true}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1007,6 +1014,57 @@ func TestApprovalChoicesPreserveDecisionSemantics(t *testing.T) {
 	}})
 	if len(planLabels) != 2 || planLabels[0] != "Adopt the new plan and continue" || planLabels[1] != "Do not adopt; let Auto adjust" {
 		t.Fatalf("plan-change recovery labels = %v", planLabels)
+	}
+	planApprovalLabels := approvalChoiceLabels(&event.Approval{Tool: planApprovalTool})
+	if len(planApprovalLabels) != 3 || planApprovalLabels[0] != "Start execution" ||
+		planApprovalLabels[1] != "Revise plan (keep planning)" || planApprovalLabels[2] != "Exit without executing" {
+		t.Fatalf("plan approval labels = %v", planApprovalLabels)
+	}
+}
+
+func TestPlanApprovalActionsSynchronizeTUIAndControllerMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		key      tea.KeyPressMsg
+		wantPlan bool
+	}{
+		{name: "start execution", key: tea.KeyPressMsg{Code: '1'}},
+		{name: "revise plan", key: tea.KeyPressMsg{Code: '2'}, wantPlan: true},
+		{name: "exit without executing", key: tea.KeyPressMsg{Code: '3'}},
+		{name: "legacy n keeps planning", key: tea.KeyPressMsg{Code: 'n'}, wantPlan: true},
+		{name: "escape keeps planning", key: tea.KeyPressMsg{Code: tea.KeyEscape}, wantPlan: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := control.New(control.Options{})
+			t.Cleanup(ctrl.Close)
+			m := newTestChatTUI()
+			m.ctrl = ctrl
+			m.planMode = true
+			m.ctrl.SetPlanMode(true)
+			m.pendingApproval = &event.Approval{ID: "plan", Tool: planApprovalTool}
+
+			next, _ := m.handleApprovalKey(tt.key)
+			m = next.(chatTUI)
+			if m.pendingApproval != nil {
+				t.Fatal("plan approval was not resolved")
+			}
+			if m.planMode != tt.wantPlan || m.ctrl.PlanMode() != tt.wantPlan {
+				t.Fatalf("plan mode = tui %v/controller %v, want %v", m.planMode, m.ctrl.PlanMode(), tt.wantPlan)
+			}
+		})
+	}
+}
+
+func TestPlanApprovalBannerShowsThreeExplicitActions(t *testing.T) {
+	m := newTestChatTUI()
+	m.width = 120
+	m.pendingApproval = &event.Approval{ID: "plan", Tool: planApprovalTool}
+	banner := ansi.Strip(m.renderApprovalBanner())
+	for _, want := range []string{"Start execution", "Revise plan (keep planning)", "Exit without executing"} {
+		if !strings.Contains(banner, want) {
+			t.Fatalf("plan approval banner missing %q:\n%s", want, banner)
+		}
 	}
 }
 
@@ -1273,9 +1331,9 @@ func TestUserBubbleEchoedImmediately(t *testing.T) {
 }
 
 func TestUserBubbleIsLightweightTranscriptLine(t *testing.T) {
-	prevColor := colorEnabled
-	colorEnabled = true
-	defer func() { colorEnabled = prevColor }()
+	prevColor := activeColorProfile
+	activeColorProfile = colorprofile.ANSI256
+	defer func() { activeColorProfile = prevColor }()
 
 	got := renderUserBubble("hello world", 80, false)
 	plain := ansi.Strip(got)
@@ -1310,6 +1368,51 @@ func TestUnsendDiscardsBufferedEvents(t *testing.T) {
 	}
 	if len(*m.pendingCommit) != 0 {
 		t.Errorf("a discarded turn should leave nothing in scrollback, committed=%v", *m.pendingCommit)
+	}
+}
+
+func TestRecoveryPauseTurnDoneIsInformational(t *testing.T) {
+	t.Cleanup(func() { i18n.DetectLanguage("en") })
+	const backendFallback = "Automatic retries paused. Reasonix stopped repeated attempts and kept completed work. Send \"continue\" to start a fresh attempt, or add instructions to change direction."
+	tests := []struct {
+		lang string
+		want string
+	}{
+		{
+			lang: "en",
+			want: "Automatic retries paused. Reasonix stopped repeated attempts and kept completed work. Send “Continue” to start a fresh attempt, or add instructions to change direction.",
+		},
+		{
+			lang: "zh",
+			want: "已暂停自动重试。Reasonix 已停止重复尝试，并保留已完成的工作。发送“继续”即可开始新一轮，也可以补充要求来调整方向。",
+		},
+		{
+			lang: "zh-TW",
+			want: "已暫停自動重試。Reasonix 已停止重複嘗試，並保留已完成的工作。傳送「繼續」即可開始新一輪，也可以補充要求來調整方向。",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.lang, func(t *testing.T) {
+			i18n.DetectLanguage(tt.lang)
+			m := newTestChatTUI()
+			m.width = 240
+			m.ingestEvent(event.Event{
+				Kind:    event.TurnDone,
+				Err:     &agent.RecoveryPauseError{Message: backendFallback},
+				Outcome: event.TurnOutcomeRecoveryPaused,
+			})
+
+			got := ansi.Strip(strings.Join(*m.pendingCommit, "\n"))
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("recovery pause transcript = %q, want localized pause message %q", got, tt.want)
+			}
+			if tt.lang != "en" && strings.Contains(got, backendFallback) {
+				t.Fatalf("recovery pause transcript = %q, must not leak English fallback into %s", got, tt.lang)
+			}
+			if strings.Contains(got, i18n.M.ErrorPrefix) {
+				t.Fatalf("recovery pause transcript = %q, must not use error prefix %q", got, i18n.M.ErrorPrefix)
+			}
+		})
 	}
 }
 
@@ -2193,6 +2296,103 @@ func TestLanguageCommandSwitchesImmediatelyAndPersists(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `language      = "zh"`) {
 		t.Fatalf("saved config missing language=zh:\n%s", body)
+	}
+}
+
+func TestLanguageCommandRefreshesCurrentController(t *testing.T) {
+	isolateUserConfig(t)
+	i18n.DetectLanguage("en")
+	t.Cleanup(func() { i18n.DetectLanguage("en") })
+
+	oldCtrl := control.New(control.Options{Label: "deepseek-flash"})
+	t.Cleanup(oldCtrl.Close)
+	m := newTestChatTUI()
+	m.ctrl = oldCtrl
+	m.modelRef = "deepseek-flash/deepseek-v4-flash"
+	m.runtimeProfile = "full"
+	var gotSpec controllerBuildSpec
+	m.buildController = func(spec controllerBuildSpec, _ []provider.Message, _ string, _ control.SessionAPI) (*control.Controller, error) {
+		gotSpec = spec
+		return control.New(control.Options{Label: "deepseek-flash"}), nil
+	}
+
+	cmd := m.runSlashCommand("/language zh")
+	if cmd == nil {
+		t.Fatal("/language should queue a controller refresh")
+	}
+	next, _ := m.Update(cmd())
+	m = next.(chatTUI)
+	t.Cleanup(m.ctrl.Close)
+	if m.ctrl == oldCtrl {
+		t.Fatal("/language kept the stale controller after a successful refresh")
+	}
+	if gotSpec.ModelRef != m.modelRef || gotSpec.RuntimeProfile != "full" {
+		t.Fatalf("language refresh spec = %+v", gotSpec)
+	}
+}
+
+func TestCurrencyCommandPersistsAndRefreshesCurrentController(t *testing.T) {
+	isolateUserConfig(t)
+	i18n.DetectLanguage("en")
+	t.Cleanup(func() { i18n.DetectLanguage("en") })
+
+	oldCtrl := control.New(control.Options{Label: "deepseek-flash"})
+	t.Cleanup(oldCtrl.Close)
+	m := newTestChatTUI()
+	m.ctrl = oldCtrl
+	m.modelRef = "deepseek-flash/deepseek-v4-flash"
+	m.runtimeProfile = "full"
+	var gotSpec controllerBuildSpec
+	m.buildController = func(spec controllerBuildSpec, _ []provider.Message, _ string, _ control.SessionAPI) (*control.Controller, error) {
+		gotSpec = spec
+		return control.New(control.Options{Label: "deepseek-flash"}), nil
+	}
+
+	cmd := m.runSlashCommand("/currency CNY")
+	if cmd == nil {
+		t.Fatal("/currency should queue a controller refresh")
+	}
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	if got := cfg.DesktopCurrency(); got != "CNY" {
+		t.Fatalf("saved currency = %q, want CNY", got)
+	}
+	next, _ := m.Update(cmd())
+	m = next.(chatTUI)
+	t.Cleanup(m.ctrl.Close)
+	if m.ctrl == oldCtrl {
+		t.Fatal("/currency kept the stale controller after a successful refresh")
+	}
+	if gotSpec.ModelRef != m.modelRef || gotSpec.RuntimeProfile != "full" {
+		t.Fatalf("currency refresh spec = %+v", gotSpec)
+	}
+}
+
+func TestCurrencyRefreshFailureKeepsCurrentController(t *testing.T) {
+	isolateUserConfig(t)
+	oldCtrl := control.New(control.Options{Label: "deepseek-flash"})
+	t.Cleanup(oldCtrl.Close)
+	m := newTestChatTUI()
+	m.ctrl = oldCtrl
+	m.modelRef = "deepseek-flash/deepseek-v4-flash"
+	m.runtimeProfile = "full"
+	m.buildController = func(controllerBuildSpec, []provider.Message, string, control.SessionAPI) (*control.Controller, error) {
+		return nil, errors.New("build failed")
+	}
+
+	cmd := m.runCurrencySubcommand("/currency CNY")
+	if cmd == nil {
+		t.Fatal("/currency should queue a controller refresh")
+	}
+	next, _ := m.Update(cmd())
+	m = next.(chatTUI)
+	if m.ctrl != oldCtrl {
+		t.Fatal("failed currency refresh replaced the usable controller")
+	}
+	if m.modelSwitchPending || m.pendingModelSwitch != nil {
+		t.Fatal("failed currency refresh left the runtime switch pending")
+	}
+	if got := config.LoadForEdit(config.UserConfigPath()).DesktopCurrency(); got != "CNY" {
+		t.Fatalf("failed refresh should retain the persisted preference, got %q", got)
 	}
 }
 
@@ -3181,6 +3381,22 @@ func TestDynamicMCPFreshApprovalHidesRememberedChoices(t *testing.T) {
 	}
 	if strings.Contains(banner, "for this session") || strings.Contains(banner, "Always allow") {
 		t.Fatalf("approval banner offers remembered grant for destructive MCP: %q", banner)
+	}
+}
+
+func TestDynamicBashApprovalChoicesUseExactLiteralRules(t *testing.T) {
+	const command = "git status $(touch /tmp/reasonix-dynamic-approval)"
+	approval := &event.Approval{Tool: "bash", Subject: command}
+	choices := approvalChoices(approval)
+	if len(choices) != 4 {
+		t.Fatalf("dynamic Bash choices = %+v, want ordinary four-choice approval", choices)
+	}
+	want := "Bash=" + command
+	if !strings.Contains(choices[1].label, want) {
+		t.Fatalf("session choice = %q, want exact rule %q", choices[1].label, want)
+	}
+	if !strings.Contains(choices[2].label, want) {
+		t.Fatalf("persistent choice = %q, want exact rule %q", choices[2].label, want)
 	}
 }
 

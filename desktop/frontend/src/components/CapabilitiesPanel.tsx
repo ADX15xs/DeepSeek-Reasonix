@@ -4,7 +4,7 @@ import { asArray } from "../lib/array";
 import { app, openExternal } from "../lib/bridge";
 import { useT } from "../lib/i18n";
 import { mcpServerLifecycleActions, mcpServerRetryableFromAvailableList } from "../lib/mcpServerLifecycle";
-import type { CapabilitiesView, MCPMarketplaceEntry, MCPMarketplaceView, MCPServerInput, PluginAgentView, PluginCommandView, PluginCompatibilityIssue, PluginHookView, PluginInstallOptions, PluginMCPServerView, PluginSkillView, PluginView, ServerView, SkillRootSkillView, SkillRootView, SkillsSettingsView, SkillView, TabMeta } from "../lib/types";
+import type { CapabilitiesView, MCPInstallResult, MCPMarketplaceEntry, MCPMarketplaceView, MCPServerInput, PluginAgentView, PluginCommandView, PluginCompatibilityIssue, PluginHookView, PluginInstallOptions, PluginMCPServerView, PluginSkillView, PluginView, ServerView, SkillRootSkillView, SkillRootView, SkillsSettingsView, SkillView, TabMeta } from "../lib/types";
 import { InlineConfirmButton } from "./InlineConfirmButton";
 import { ResizableDrawer } from "./ResizableDrawer";
 import { Tooltip } from "./Tooltip";
@@ -17,6 +17,12 @@ import { ModalCloseButton } from "./ModalCloseButton";
 type CapTab = "servers" | "skills";
 
 type SettingsSnapshot<T> = { key: string; value: T };
+
+async function installMCPServer(input: MCPServerInput): Promise<MCPInstallResult> {
+  const result = await app.InstallMCPServer(input);
+  if (result.state === "issue") throw new Error(result.message);
+  return result;
+}
 
 let mcpSettingsSnapshot: SettingsSnapshot<ServerView[]> | null = null;
 let skillsSettingsSnapshot: SettingsSnapshot<SkillsSettingsView> | null = null;
@@ -253,7 +259,11 @@ export function CapabilitiesPanel({
                   </div>
                 )}
                 {adding ? (
-                  <AddServerForm busy={busy} onCancel={() => setAdding(false)} onAdd={async (input) => (await mutate(() => app.AddMCPServer(input))) && setAdding(false)} />
+                  <MCPServerSettingsEditor
+                    busy={busy}
+                    onCancel={() => setAdding(false)}
+                    onSubmit={(input) => void mutate(() => installMCPServer(input)).then((ok) => { if (ok) setAdding(false); })}
+                  />
                 ) : null}
               </section>
             ) : (
@@ -1026,6 +1036,12 @@ function ServerDetails({
           <span className="cap-detail__label">{t("caps.status")}</span>
           <span className="cap-detail__value">{serverStatusLabel(s, t)}</span>
         </div>
+        {s.source && (
+          <div className="cap-detail">
+            <span className="cap-detail__label">{t("caps.serverSource")}</span>
+            <span className="cap-detail__value">{mcpServerSourceLabel(s, t)}</span>
+          </div>
+        )}
         <div className="cap-detail">
           <span className="cap-detail__label">{t("caps.transport")}</span>
           <span className="cap-detail__value">{s.transport}</span>
@@ -1249,20 +1265,50 @@ function parseKeyValueText(text: string): Record<string, string> {
 }
 
 function serverStatusLabel(s: ServerView, t: ReturnType<typeof useT>): string {
-  switch (s.status) {
+  // Prefer product availability so idle enabled servers are not shown as disconnected.
+  const availability = s.availability
+    || (s.enabled === false || s.status === "disabled"
+      ? "disabled"
+      : s.status === "connected"
+        ? "connected"
+        : s.status === "initializing"
+          ? "starting"
+          : s.status === "failed"
+            ? (s.authStatus === "required" ? "auth_required" : "start_failed")
+            : s.status === "deferred"
+              ? "available_on_demand"
+              : s.status);
+  switch (availability) {
     case "connected":
       return t("caps.connected");
-    case "deferred":
+    case "available_on_demand":
       return t("caps.deferred");
-    case "initializing":
+    case "starting":
       return t("caps.initializing");
     case "disabled":
-      return s.configured && !s.autoStart ? t("caps.disabledAutoStart") : t("caps.disabled");
-    case "failed":
-      if (s.authStatus === "required") return t("caps.authRequired");
+      return t("caps.disabled");
+    case "auth_required":
+      return t("caps.authRequired");
+    case "project_auth_changed":
+      return t("caps.projectAuthChanged");
+    case "start_failed":
       return t("caps.failed");
     default:
-      return s.status;
+      switch (s.status) {
+        case "connected":
+          return t("caps.connected");
+        case "deferred":
+          return t("caps.deferred");
+        case "initializing":
+          return t("caps.initializing");
+        case "disabled":
+          return t("caps.disabled");
+        case "failed":
+          if (s.authStatus === "required") return t("caps.authRequired");
+          return t("caps.failed");
+        default:
+          return s.status;
+      }
   }
 }
 
@@ -1493,72 +1539,98 @@ function summarizeSkillDescription(description: string): string {
   return `${normalized.slice(0, 128).trim()}…`;
 }
 
-function AddServerForm({
-  busy,
-  onCancel,
-  onAdd,
-}: {
-  busy: boolean;
-  onCancel: () => void;
-  onAdd: (input: MCPServerInput) => void;
-}) {
-  const t = useT();
-  const [name, setName] = useState("");
-  const [transport, setTransport] = useState("stdio");
-  const [command, setCommand] = useState("");
-  const [url, setUrl] = useState("");
-  const [headers, setHeaders] = useState("");
-  const [env, setEnv] = useState("");
+function tokenizeMCPCommand(raw: string): string[] {
+	const tokens: string[] = [];
+	let token = "";
+	let quote = "";
+	for (let i = 0; i < raw.length; i += 1) {
+		const ch = raw[i];
+		if (quote) {
+			if (ch === quote) {
+				quote = "";
+				continue;
+			}
+			if (ch === "\\" && quote === '"' && i + 1 < raw.length && /["\\]/.test(raw[i + 1])) {
+				token += raw[i + 1];
+				i += 1;
+				continue;
+			}
+			token += ch;
+			continue;
+		}
+		if (ch === '"' || ch === "'") {
+			quote = ch;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < raw.length && /\s/.test(raw[i + 1])) {
+			token += raw[i + 1];
+			i += 1;
+			continue;
+		}
+		if (/\s/.test(ch)) {
+			if (token) tokens.push(token);
+			token = "";
+			continue;
+		}
+		token += ch;
+	}
+	if (token) tokens.push(token);
+	return tokens;
+}
 
-  const isStdio = transport === "stdio";
-  const ready = name.trim() !== "" && (isStdio ? command.trim() !== "" : url.trim() !== "");
+function firstMCPCommandOperand(args: string[]): string {
+	const valueFlags = new Set(["-p", "--package", "-c", "--call", "--node-options", "--python"]);
+	let options = true;
+	for (let i = 0; i < args.length; i += 1) {
+		const arg = args[i];
+		if (options && arg === "--") {
+			options = false;
+			continue;
+		}
+		if (options && arg.startsWith("-")) {
+			if (valueFlags.has(arg)) i += 1;
+			continue;
+		}
+		return arg;
+	}
+	return "";
+}
 
-  const submit = () => {
-    const envText = env.trim();
-    const headerText = headers.trim();
-    onAdd({
-      name: name.trim(),
-      transport,
-      command: isStdio ? command.trim() : "",
-      args: [],
-      url: isStdio ? "" : url.trim(),
-      env: envText === "" ? null : parseKeyValueText(envText),
-      headers: isStdio || headerText === "" ? null : parseKeyValueText(headerText),
-    });
-  };
+function quickMCPName(raw: string): string {
+	const argv = tokenizeMCPCommand(raw);
+	const executable = argv[0]?.split(/[\\/]/).pop()?.toLowerCase().replace(/\.(?:cmd|exe|bat)$/i, "") || "";
+	let candidate = argv[0] || "mcp-server";
+	if (["npx", "bunx", "uvx"].includes(executable)) {
+		candidate = firstMCPCommandOperand(argv.slice(1)) || candidate;
+	} else if (["python", "python3", "py"].includes(executable)) {
+		const moduleIndex = argv.findIndex((arg) => arg === "-m");
+		candidate = moduleIndex >= 0 ? argv[moduleIndex + 1] || candidate : firstMCPCommandOperand(argv.slice(1)) || candidate;
+	} else if (executable === "node") {
+		candidate = firstMCPCommandOperand(argv.slice(1)) || candidate;
+	} else if (executable === "uv" && argv[1] === "run") {
+		candidate = firstMCPCommandOperand(argv.slice(2)) || candidate;
+	}
+	const base = candidate.split(/[\\/]/).pop() || candidate;
+	const unversioned = base.replace(/@[^@]+$/, "").replace(/\.(?:cmd|exe|bat)$/i, "");
+	const sanitized = unversioned.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+	return sanitized && /[a-z0-9]/.test(sanitized) && !["npx", "uvx", "uv", "node", "bunx", "python", "python3", "py"].includes(sanitized)
+		? sanitized
+		: "mcp-server";
+}
 
-  return (
-    <div className="prov-card prov-card--edit">
-      <input className="mem-input" placeholder={t("caps.namePlaceholder")} value={name} onChange={(e) => setName(e.target.value)} />
-      <label className="set-label">{t("caps.transport")}</label>
-      <select className="mem-select" value={transport} onChange={(e) => setTransport(e.target.value)}>
-        <option value="stdio">stdio</option>
-        <option value="http">http</option>
-        <option value="sse">sse</option>
-      </select>
-      {isStdio ? (
-        <input className="mem-input" placeholder={t("caps.commandPlaceholder")} value={command} onChange={(e) => setCommand(e.target.value)} />
-      ) : (
-        <input className="mem-input" placeholder={t("caps.urlPlaceholder")} value={url} onChange={(e) => setUrl(e.target.value)} />
-      )}
-      {!isStdio && (
-        <>
-          <label className="set-label">{t("caps.headersLabel")}</label>
-          <textarea className="mem-textarea" value={headers} onChange={(e) => setHeaders(e.target.value)} placeholder={t("caps.headersPlaceholder")} spellCheck={false} />
-        </>
-      )}
-      <label className="set-label">{t("caps.envLabel")}</label>
-      <textarea className="mem-textarea" value={env} onChange={(e) => setEnv(e.target.value)} placeholder={t("caps.envPlaceholder")} spellCheck={false} />
-      <div className="prov-card__actions">
-        <button className="btn btn--small" onClick={onCancel} disabled={busy}>
-          {t("common.cancel")}
-        </button>
-        <button className="btn btn--primary btn--small" onClick={submit} disabled={busy || !ready}>
-          {t("caps.add")}
-        </button>
-      </div>
-    </div>
-  );
+export function parseMCPQuickDefinition(raw: string): MCPServerInput {
+  const definition = raw.trim();
+  if (definition.startsWith("{")) return parseMCPServerJSON(definition).input;
+  if (/^https?:\/\//i.test(definition)) {
+    let name = "remote-mcp";
+    try {
+      name = new URL(definition).hostname.replace(/^www\./, "").split(".")[0] || name;
+    } catch {
+      throw new Error("invalid" satisfies MCPServerJSONError);
+    }
+    return { name, transport: "http", command: "", args: [], url: definition, env: null, headers: null };
+  }
+  return { name: quickMCPName(definition), transport: "stdio", command: definition, args: [], url: "", env: null, headers: null };
 }
 
 type PluginInstallPlanAction = {
@@ -2305,12 +2377,19 @@ function mcpSettingsServerSummary(server: ServerView, t: ReturnType<typeof useT>
 	return parts.join(" · ");
 }
 
-function mcpLaunchAuthorizationRequired(server: ServerView): boolean {
-	return Boolean(server.requiresLaunchApproval);
-}
-
-function mcpLaunchAuthorizationLabel(t: ReturnType<typeof useT>): string {
-	return t("caps.authorizeAndConnect");
+function mcpServerSourceLabel(server: ServerView, t: ReturnType<typeof useT>): string {
+	switch (server.source) {
+		case "project":
+			return server.configSource
+				? t("caps.sourceProjectConfig", { config: server.configSource })
+				: t("caps.sourceProject");
+		case "plugin":
+			return t("caps.sourcePlugin");
+		case "builtin":
+			return t("caps.sourceBuiltin");
+		default:
+			return t("caps.sourceUser");
+	}
 }
 
 function mcpSettingsSearchText(server: ServerView): string {
@@ -2319,6 +2398,8 @@ function mcpSettingsSearchText(server: ServerView): string {
 		server.transport,
 		serverCommand(server),
 		server.error,
+		server.source,
+		server.configSource,
 		server.managedByPlugin,
 		...(server.toolList ?? []).flatMap((tool) => [tool.name, tool.description]),
 	].filter(Boolean).join(" ").toLowerCase();
@@ -2351,27 +2432,20 @@ function MCPSettingsServerRow({
 	busy,
 	onOpen,
 	onRetry,
-	onAuthorize,
 	onToggle,
 }: {
 	server: ServerView;
 	busy: boolean;
 	onOpen: () => void;
 	onRetry: () => void;
-	onAuthorize: () => void;
 	onToggle: (enabled: boolean) => void;
 }) {
 	const t = useT();
 	const lifecycle = mcpServerLifecycleActions(server);
 	const target = serverCommand(server);
 	const opensAuth = shouldOpenAuth(server);
-	const requiresAuthorization = !opensAuth && server.status !== "disabled" && Boolean(server.requiresLaunchApproval);
-	const actionLabel = requiresAuthorization ? mcpLaunchAuthorizationLabel(t) : serverActionLabel(server, t);
+	const actionLabel = serverActionLabel(server, t);
 	const handlePrimaryAction = () => {
-		if (requiresAuthorization) {
-			onAuthorize();
-			return;
-		}
 		if (opensAuth) {
 			openExternal((server.authUrl || "").trim());
 			return;
@@ -2390,6 +2464,7 @@ function MCPSettingsServerRow({
 						<span className={`cap-dot cap-dot--${server.status}`} aria-hidden />
 						<span className="cap-mcp-list-row__name">{server.name}</span>
 						<span className="cap-mcp-list-row__transport">{server.transport}</span>
+						{server.source === "project" && <span className="cap-row__builtin">{t("caps.projectServerBadge")}</span>}
 						{server.builtIn && <span className="cap-row__builtin">{t("caps.builtIn")}</span>}
 					</span>
 					<span className={`cap-mcp-list-row__summary${server.status === "failed" ? " cap-mcp-list-row__summary--error" : ""}`}>
@@ -2403,7 +2478,7 @@ function MCPSettingsServerRow({
 				<ChevronRight className="cap-mcp-list-row__chevron" aria-hidden size={16} />
 			</button>
 			<div className="cap-mcp-list-row__actions">
-				{requiresAuthorization || lifecycle.showRetryInRow ? (
+				{lifecycle.showRetryInRow ? (
 					<button className="btn btn--small" disabled={busy} type="button" onClick={handlePrimaryAction}>
 						{actionLabel}
 					</button>
@@ -2432,7 +2507,6 @@ function MCPSettingsServerGroup({
 	busy,
 	onOpen,
 	onRetry,
-	onAuthorize,
 	onToggle,
 }: {
 	title: string;
@@ -2441,7 +2515,6 @@ function MCPSettingsServerGroup({
 	busy: boolean;
 	onOpen: (name: string) => void;
 	onRetry: (name: string) => void;
-	onAuthorize: (name: string) => void;
 	onToggle: (name: string, enabled: boolean) => void;
 }) {
 	if (servers.length === 0) return null;
@@ -2461,7 +2534,6 @@ function MCPSettingsServerGroup({
 						busy={busy}
 						onOpen={() => onOpen(server.name)}
 						onRetry={() => onRetry(server.name)}
-						onAuthorize={() => onAuthorize(server.name)}
 						onToggle={(enabled) => onToggle(server.name, enabled)}
 					/>
 				))}
@@ -2488,6 +2560,27 @@ function mcpServerEditorDraft(server?: ServerView): MCPServerEditorDraft {
 		autoStart: server?.autoStart,
 		callTimeoutSeconds: server?.callTimeoutSeconds,
 		toolTimeoutSeconds: server?.toolTimeoutSeconds ? { ...server.toolTimeoutSeconds } : undefined,
+	};
+}
+
+function mcpServerInputDraft(input: MCPServerInput): MCPServerEditorDraft {
+	const transport = normalizeTransportValue(input.transport);
+	const command = transport === "stdio" ? [input.command, ...input.args].filter(Boolean).join(" ").trim() : "";
+	return {
+		name: input.name,
+		transport,
+		command,
+		structuredCommand: transport === "stdio" ? {
+			display: command,
+			command: input.command,
+			args: [...input.args],
+		} : undefined,
+		url: transport === "stdio" ? "" : input.url,
+		env: input.env ? Object.entries(input.env).map(([key, value]) => `${key}=${value}`).join("\n") : "",
+		headers: input.headers ? Object.entries(input.headers).map(([key, value]) => `${key}=${value}`).join("\n") : "",
+		autoStart: input.autoStart ?? undefined,
+		callTimeoutSeconds: input.callTimeoutSeconds ?? undefined,
+		toolTimeoutSeconds: input.toolTimeoutSeconds ? { ...input.toolTimeoutSeconds } : undefined,
 	};
 }
 
@@ -2695,7 +2788,10 @@ function MCPServerSettingsEditor({
 	onSubmit: (input: MCPServerInput) => void;
 }) {
 	const t = useT();
-	const [mode, setMode] = useState<"form" | "json">("form");
+	type EditorMode = "quick" | "form" | "json";
+	const [mode, setMode] = useState<EditorMode>(server ? "form" : "quick");
+	const [definition, setDefinition] = useState("");
+	const [quickError, setQuickError] = useState("");
 	const [draft, setDraft] = useState<MCPServerEditorDraft>(() => mcpServerEditorDraft(server));
 	const [json, setJSON] = useState(() => mcpServerDraftJSON(mcpServerEditorDraft(server)));
 	const [jsonError, setJSONError] = useState("");
@@ -2704,8 +2800,28 @@ function MCPServerSettingsEditor({
 	const ready = Boolean(draft.name.trim() && (isStdio ? draft.command.trim() : draft.url.trim()));
 
 	const updateDraft = (patch: Partial<MCPServerEditorDraft>) => setDraft((current) => ({ ...current, ...patch }));
-	const switchMode = (next: "form" | "json") => {
+	const switchMode = (next: EditorMode) => {
 		if (next === mode) return;
+		if (next === "quick") {
+			setQuickError("");
+			setMode("quick");
+			return;
+		}
+		if (mode === "quick") {
+			if (definition.trim()) {
+				try {
+					const nextDraft = mcpServerInputDraft(parseMCPQuickDefinition(definition));
+					setDraft(nextDraft);
+					if (next === "json") setJSON(mcpServerDraftJSON(nextDraft));
+					setQuickError("");
+				} catch (error) {
+					setQuickError(mcpServerJSONErrorLabel(error, t));
+					return;
+				}
+			}
+			setMode(next);
+			return;
+		}
 		if (next === "json") {
 			setJSON(mcpServerDraftJSON(draft));
 			setJSONError("");
@@ -2728,6 +2844,15 @@ function MCPServerSettingsEditor({
 	};
 	const finalize = (input: MCPServerInput) => (server ? withExplicitMCPClears(input) : input);
 	const submit = () => {
+		if (mode === "quick") {
+			try {
+				setQuickError("");
+				onSubmit(parseMCPQuickDefinition(definition));
+			} catch (error) {
+				setQuickError(mcpServerJSONErrorLabel(error, t));
+			}
+			return;
+		}
 		if (mode === "form") {
 			onSubmit(finalize(mcpServerDraftInput(draft)));
 			return;
@@ -2744,6 +2869,11 @@ function MCPServerSettingsEditor({
 	return (
 		<div className="cap-mcp-editor">
 			<div className="cap-mcp-editor__mode set-seg" role="tablist" aria-label={t("caps.editorMode")}>
+				{!server && (
+					<button className={`set-seg__btn${mode === "quick" ? " set-seg__btn--on" : ""}`} type="button" role="tab" aria-selected={mode === "quick"} onClick={() => switchMode("quick")}>
+						{t("caps.quickMode")}
+					</button>
+				)}
 				<button className={`set-seg__btn${mode === "form" ? " set-seg__btn--on" : ""}`} type="button" role="tab" aria-selected={mode === "form"} onClick={() => switchMode("form")}>
 					{t("caps.formMode")}
 				</button>
@@ -2751,7 +2881,28 @@ function MCPServerSettingsEditor({
 					{t("caps.jsonMode")}
 				</button>
 			</div>
-			{mode === "form" ? (
+			{mode === "quick" ? (
+				<div className="cap-mcp-quick">
+					<label className="cap-mcp-field">
+						<span>{t("caps.installDefinition")}</span>
+						<textarea
+							className="mem-textarea cap-mcp-quick__input"
+							value={definition}
+							disabled={busy}
+							onChange={(event) => { setDefinition(event.target.value); setQuickError(""); }}
+							placeholder={t("caps.installDefinitionPlaceholder")}
+							spellCheck={false}
+						/>
+					</label>
+					<div className="cap-mcp-quick__hint">{t("caps.installDefinitionHint")}</div>
+					<div className="cap-mcp-quick__benefits" aria-label={t("caps.quickBenefitsLabel")}>
+						<span>{t("caps.quickDetectTransport")}</span>
+						<span>{t("caps.quickVerifyConnection")}</span>
+						<span>{t("caps.quickEnableTools")}</span>
+					</div>
+					{quickError && <div className="banner banner--error" role="alert">{quickError}</div>}
+				</div>
+			) : mode === "form" ? (
 				<div className="cap-mcp-form-grid">
 					<label className="cap-mcp-field cap-mcp-field--name">
 						<span>{t("caps.name")}</span>
@@ -2811,7 +2962,7 @@ function MCPServerSettingsEditor({
 			)}
 			<div className="cap-mcp-editor__actions">
 				<button className="btn btn--small" disabled={busy} type="button" onClick={onCancel}>{t("common.cancel")}</button>
-				<button className="btn btn--primary btn--small" disabled={busy || (mode === "form" && !ready)} type="button" onClick={submit}>
+				<button className="btn btn--primary btn--small" disabled={busy || (mode === "quick" ? !definition.trim() : mode === "form" && !ready)} type="button" onClick={submit}>
 					{server ? t("caps.saveConfig") : t("caps.addAndConnect")}
 				</button>
 			</div>
@@ -2871,8 +3022,6 @@ export function MCPServersSettingsPage() {
 			setBusy(false);
 		}
 	};
-	const authorizeProjectAndConnect = async (name: string) =>
-		mutate(() => app.AuthorizeAndConnectMCPServer(name));
 	const browseMarketplace = async (search = marketplaceQuery) => {
 		setBusy(true);
 		setErr(null);
@@ -2893,15 +3042,22 @@ export function MCPServersSettingsPage() {
 	};
 	const installMarketplaceEntry = async (entry: MCPMarketplaceEntry) => {
 		const current = await app.MCPMarketplaceResolve(entry.name);
-		return app.AddMCPServer(mcpMarketplaceServerInput(current, servers ?? []));
+		return installMCPServer(mcpMarketplaceServerInput(current, servers ?? []));
 	};
 	const filteredServers = useMemo(() => {
 		const sorted = sortServersForDisplay(servers ?? []);
 		const normalizedQuery = query.trim().toLowerCase();
 		return normalizedQuery ? sorted.filter((server) => mcpSettingsSearchText(server).includes(normalizedQuery)) : sorted;
 	}, [query, servers]);
-	const configuredServers = useMemo(() => filteredServers.filter((server) => !server.managedByPlugin), [filteredServers]);
-	const managedServers = useMemo(() => filteredServers.filter((server) => Boolean(server.managedByPlugin)), [filteredServers]);
+	const projectServers = useMemo(() => filteredServers.filter((server) => server.source === "project"), [filteredServers]);
+	const managedServers = useMemo(
+		() => filteredServers.filter((server) => server.source === "plugin" || Boolean(server.managedByPlugin)),
+		[filteredServers],
+	);
+	const installedServers = useMemo(
+		() => filteredServers.filter((server) => server.source !== "project" && server.source !== "plugin" && !server.managedByPlugin),
+		[filteredServers],
+	);
 	const selectedServer = screen.kind === "detail" || screen.kind === "edit"
 		? servers?.find((server) => server.name === screen.name)
 		: undefined;
@@ -2950,12 +3106,21 @@ export function MCPServersSettingsPage() {
 					{!loading && servers.length === 0 && <div className="mem-empty">{t("caps.noServers")}</div>}
 					{!loading && servers.length > 0 && filteredServers.length === 0 && <div className="mem-empty">{t("caps.noServerMatches")}</div>}
 					<MCPSettingsServerGroup
-						title={t("caps.configuredServers")}
-						servers={configuredServers}
+						title={t("caps.projectServers")}
+						hint={t("caps.projectServersHint")}
+						servers={projectServers}
 						busy={actionBusy}
 						onOpen={(name) => setScreen({ kind: "detail", name })}
 						onRetry={(name) => void mutate(() => app.ReconnectMCPServer(name))}
-						onAuthorize={(name) => void authorizeProjectAndConnect(name)}
+						onToggle={(name, enabled) => void mutate(() => app.SetMCPServerEnabled(name, enabled))}
+					/>
+					<MCPSettingsServerGroup
+						title={t("caps.installedServers")}
+						hint={t("caps.installedServersHint")}
+						servers={installedServers}
+						busy={actionBusy}
+						onOpen={(name) => setScreen({ kind: "detail", name })}
+						onRetry={(name) => void mutate(() => app.ReconnectMCPServer(name))}
 						onToggle={(name, enabled) => void mutate(() => app.SetMCPServerEnabled(name, enabled))}
 					/>
 					<MCPSettingsServerGroup
@@ -2965,7 +3130,6 @@ export function MCPServersSettingsPage() {
 						busy={actionBusy}
 						onOpen={(name) => setScreen({ kind: "detail", name })}
 						onRetry={(name) => void mutate(() => app.ReconnectMCPServer(name))}
-						onAuthorize={(name) => void authorizeProjectAndConnect(name)}
 						onToggle={(name, enabled) => void mutate(() => app.SetMCPServerEnabled(name, enabled))}
 					/>
 				</>
@@ -3017,7 +3181,7 @@ export function MCPServersSettingsPage() {
 					<MCPServerSettingsEditor
 						busy={busy}
 						onCancel={() => setScreen({ kind: "list" })}
-						onSubmit={(input) => void mutate(() => app.AddMCPServer(input)).then((ok) => { if (ok) setScreen({ kind: "list" }); })}
+						onSubmit={(input) => void mutate(() => installMCPServer(input)).then((ok) => { if (ok) setScreen({ kind: "list" }); })}
 					/>
 				</div>
 			)}
@@ -3044,12 +3208,6 @@ export function MCPServersSettingsPage() {
 							</details>
 						</div>
 					)}
-					{mcpLaunchAuthorizationRequired(selectedServer) && <div className="cap-mcp-detail-error">
-						<div className="drawer__summary">{t("caps.projectLaunchExplanation")}</div>
-						<div className="cap-mcp-editor__actions">
-							<button className="btn btn--small" disabled={actionBusy} type="button" onClick={() => void authorizeProjectAndConnect(selectedServer.name)}>{mcpLaunchAuthorizationLabel(t)}</button>
-						</div>
-					</div>}
 					<ServerDetails
 						s={selectedServer}
 						tools={selectedServer.toolList ?? []}

@@ -3,6 +3,7 @@ package main
 import (
 	"path/filepath"
 
+	"reasonix/internal/evidence"
 	"reasonix/internal/provider"
 	"reasonix/internal/remote/protocol"
 )
@@ -43,7 +44,9 @@ func workbenchHistoryPage(page protocol.HistoryPage) HistoryPage {
 		for _, call := range message.ToolCalls {
 			projected.ToolCalls = append(projected.ToolCalls, HistoryToolCall{
 				ID: call.ID, Name: call.Name, Arguments: workbenchString(call.Arguments),
-				Subject: call.Subject, Summary: workbenchString(call.Summary), Diff: workbenchString(call.Diff),
+				ResolvedName: call.ResolvedName, CapabilityID: call.CapabilityID,
+				ResolvedReadOnly: call.ResolvedReadOnly,
+				Subject:          call.Subject, Summary: workbenchString(call.Summary), Diff: workbenchString(call.Diff),
 				Added: call.Added, Removed: call.Removed, ArgumentsArchived: call.ArgumentsArchived,
 			})
 		}
@@ -103,6 +106,29 @@ func workbenchModels(catalog protocol.WorkspaceCatalogResult, current string) []
 	return out
 }
 
+func workbenchCanonicalTodos(values []protocol.TodoItem) *[]evidence.TodoItem {
+	if values == nil {
+		return nil
+	}
+	out := make([]evidence.TodoItem, 0, len(values))
+	for _, todo := range values {
+		switch todo.Status {
+		case protocol.TodoPending, protocol.TodoInProgress, protocol.TodoCompleted:
+		default:
+			continue
+		}
+		level := todo.Level
+		if level < 0 {
+			level = 0
+		}
+		out = append(out, evidence.TodoItem{
+			Content: workbenchString(todo.Content), Status: string(todo.Status),
+			ActiveForm: todo.ActiveForm, Level: level,
+		})
+	}
+	return &out
+}
+
 func workbenchMeta(snapshot protocol.SessionSnapshot, workspace string) Meta {
 	profile := snapshot.Meta.ResolvedProfile
 	label := profile.Model
@@ -113,6 +139,7 @@ func workbenchMeta(snapshot protocol.SessionSnapshot, workspace string) Meta {
 		Bypass:            profile.ToolApprovalMode == protocol.ToolApprovalYOLO,
 		CollaborationMode: string(profile.CollaborationMode), ToolApprovalMode: string(profile.ToolApprovalMode),
 		TokenMode: string(profile.TokenMode), Goal: workbenchString(snapshot.Meta.Goal), GoalStatus: string(snapshot.Meta.GoalStatus),
+		CanonicalTodos: workbenchCanonicalTodos(snapshot.Todos),
 	}
 }
 

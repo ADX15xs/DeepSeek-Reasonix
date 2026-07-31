@@ -139,6 +139,10 @@ type MemoryControl interface {
 	SaveMemory(m memory.Memory) (string, error)
 	ForgetMemory(name string) error
 	QueueMemory(note string)
+	MemoryRevisions(ref string) []memory.Memory
+	RestoreMemory(ref string, revision int) (memory.Memory, error)
+	RestoreArchivedMemory(archivePath string) (memory.Memory, error)
+	LastMemoryRecall() memory.RecallResult
 }
 
 // Capabilities covers the session's pluggable surface — MCP servers, skills,
@@ -162,6 +166,7 @@ type Capabilities interface {
 	RunSkill(input string) (sent string, found bool)
 	AddMCPServer(e config.PluginEntry) (int, error)
 	ConnectMCPServer(e config.PluginEntry) (int, error)
+	RegisterMCPServerOnDemand(e config.PluginEntry) (int, error)
 	ConnectConfiguredMCPServer(name string) (int, error)
 	DisconnectMCPServer(name string) bool
 	RemoveMCPServer(name string) (disconnected bool, err error)

@@ -1,13 +1,11 @@
 import { lazy, memo, Suspense, useDeferredValue, useMemo, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
 import { CodeViewer } from "./CodeViewer";
+import { RichMarkdownLink } from "./githubLink";
 import { normalizeMath } from "./mathNormalize";
-import { openExternal } from "../lib/bridge";
+import { reasonixRehypePlugins, reasonixRemarkPlugins } from "./markdownRemarkPlugins";
 import { markdownImageSource } from "../lib/markdownImage";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
@@ -17,10 +15,9 @@ const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 // Fenced code blocks go through CodeViewer for syntax highlighting; inline
 // code is a styled <code>. Links open in the system browser.
 //
-// The math pre-pass in mathNormalize normalises LLM-native \(…\)/\[…\]
-// delimiters to the $/$$ syntax remark-math understands, gates single-$
-// pairs through a classifier to avoid false positives on $5, $PATH, etc.,
-// and runs KaTeX-specific normalisations (text-mode escapes, |→\vert).
+// The math pre-pass repairs LLM-native delimiters and display structure.
+// remarkMathPolicy then classifies parsed inline-math AST nodes using their
+// surrounding prose, avoiding false positives on currency and env vars.
 
 const STATUS_MARKER_RE = /(?:✅|☑|☒|✔️?|✓|\[[xX ]\])/;
 const STATUS_MARKER_GLOBAL_RE = /(?:✅|☑|☒|✔️?|✓|\[[xX ]\])/g;
@@ -115,24 +112,7 @@ function createComponents(plainStatusBlocks: boolean): Components {
       }
       return <code className="md-code">{children}</code>;
     },
-    a: ({ href, children }) => (
-      <a
-        href={href}
-        onClick={(e) => {
-          e.preventDefault();
-          if (href) openExternal(href);
-        }}
-        onAuxClick={(e) => {
-          e.preventDefault();
-          if (href) openExternal(href);
-        }}
-        onMouseDown={(e) => {
-          if (e.button === 1) e.preventDefault();
-        }}
-      >
-        {children}
-      </a>
-    ),
+    a: ({ href, children }) => <RichMarkdownLink href={href}>{children}</RichMarkdownLink>,
     img: ({ src, alt, title }) => (
       <img
         src={markdownImageSource(src)}
@@ -148,9 +128,11 @@ function createComponents(plainStatusBlocks: boolean): Components {
 const MarkdownRenderer = memo(function MarkdownRenderer({
   text,
   plainStatusBlocks = false,
+  bare = false,
 }: {
   text: string;
   plainStatusBlocks?: boolean;
+  bare?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   // Defer the markdown source so the expensive react-markdown pass doesn't
@@ -158,17 +140,16 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
   const deferredText = useDeferredValue(text);
   const mathContent = useMemo(() => normalizeMath(deferredText), [deferredText]);
   const components = useMemo(() => createComponents(plainStatusBlocks), [plainStatusBlocks]);
-  return (
-    <div className="md" ref={containerRef}>
-      <ReactMarkdown
-        remarkPlugins={REMARK_PLUGINS}
-        rehypePlugins={REHYPE_PLUGINS}
-        components={components}
-      >
-        {mathContent}
-      </ReactMarkdown>
-    </div>
+  const content = (
+    <ReactMarkdown
+      remarkPlugins={reasonixRemarkPlugins}
+      rehypePlugins={reasonixRehypePlugins}
+      components={components}
+    >
+      {mathContent}
+    </ReactMarkdown>
   );
+  return bare ? content : <div className="md" ref={containerRef}>{content}</div>;
 });
 
 export default MarkdownRenderer;

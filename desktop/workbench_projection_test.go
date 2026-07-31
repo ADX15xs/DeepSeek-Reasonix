@@ -17,18 +17,26 @@ import (
 func strptr(value string) *string { return &value }
 
 func TestWorkbenchHistoryProjectionPreservesReasoningToolsAndCitations(t *testing.T) {
+	resolvedReadOnly := false
 	page := workbenchHistoryPage(protocol.HistoryPage{
 		Messages: []protocol.HistoryMessage{{
 			Role: "assistant", Content: strptr("done"), Reasoning: strptr("thought"),
 			MemoryCitations: []eventwire.MemoryCitation{{ID: "m1", Source: "MEMORY.md", LineStart: 2, LineEnd: 3}},
-			ToolCalls:       []protocol.HistoryToolCall{{ID: "tc1", Name: "read_file", Arguments: strptr(`{"path":"a"}`), Summary: strptr("read a")}},
+			ToolCalls: []protocol.HistoryToolCall{{
+				ID: "tc1", Name: "use_capability", Arguments: strptr(`{"action":"call","capability_id":"mcp-tool:db/write"}`),
+				ResolvedName: "mcp__db__write", CapabilityID: "mcp-tool:db/write",
+				ResolvedReadOnly: &resolvedReadOnly, Summary: strptr("write a"),
+			}},
 		}},
 		StartTurn: 1, EndTurn: 1, TotalTurns: 1,
 	})
 	if len(page.Messages) != 1 || page.Messages[0].Content != "done" || page.Messages[0].Reasoning != "thought" {
 		t.Fatalf("history projection lost message fields: %+v", page)
 	}
-	if got := page.Messages[0].ToolCalls; len(got) != 1 || got[0].Arguments != `{"path":"a"}` {
+	if got := page.Messages[0].ToolCalls; len(got) != 1 ||
+		got[0].Arguments != `{"action":"call","capability_id":"mcp-tool:db/write"}` ||
+		got[0].ResolvedName != "mcp__db__write" || got[0].CapabilityID != "mcp-tool:db/write" ||
+		got[0].ResolvedReadOnly == nil || *got[0].ResolvedReadOnly {
 		t.Fatalf("history projection lost tool call: %+v", got)
 	}
 	if got := page.Messages[0].MemoryCitations; len(got) != 1 || got[0].ID != "m1" || got[0].LineEnd != 3 {
@@ -46,6 +54,29 @@ func TestWorkbenchSnapshotProjectionUsesRemoteWorkspaceAndProfile(t *testing.T) 
 	meta := workbenchMeta(snapshot, "/srv/app")
 	if meta.WorkspaceRoot != "/srv/app" || meta.Label != "deepseek/deepseek-chat" || !meta.AutoApproveTools || meta.Bypass {
 		t.Fatalf("meta projection = %+v", meta)
+	}
+}
+
+func TestWorkbenchSnapshotProjectionPreservesCanonicalTodos(t *testing.T) {
+	content := "Ship the fix"
+	meta := workbenchMeta(protocol.SessionSnapshot{Todos: []protocol.TodoItem{{
+		Content: &content, Status: protocol.TodoCompleted, ActiveForm: "Shipping the fix", Level: 1,
+	}}}, "/srv/app")
+	if meta.CanonicalTodos == nil {
+		t.Fatal("canonical todos are unavailable, want projected remote snapshot")
+	}
+	if got := *meta.CanonicalTodos; len(got) != 1 || got[0].Content != content || got[0].Status != "completed" || got[0].ActiveForm != "Shipping the fix" || got[0].Level != 1 {
+		t.Fatalf("canonical todos = %+v", got)
+	}
+
+	empty := workbenchMeta(protocol.SessionSnapshot{Todos: []protocol.TodoItem{}}, "/srv/app")
+	if empty.CanonicalTodos == nil || len(*empty.CanonicalTodos) != 0 {
+		t.Fatalf("empty canonical todos = %#v, want authoritative empty list", empty.CanonicalTodos)
+	}
+
+	unavailable := workbenchMeta(protocol.SessionSnapshot{}, "/srv/app")
+	if unavailable.CanonicalTodos != nil {
+		t.Fatalf("unavailable canonical todos = %#v, want omitted field", unavailable.CanonicalTodos)
 	}
 }
 
@@ -197,6 +228,9 @@ func TestRemoteUnsupportedCapabilitiesNeverFallBackToLocal(t *testing.T) {
 	if app.AutoResearchList("local-tab") == nil || app.AutoResearchFindings("local-tab", 10) == nil {
 		t.Fatal("Remote auto-research reads returned nil collections")
 	}
+	if app.MemoryRevisions("local-only") == nil || app.MemoryRevisionsForTab("local-tab", "local-only") == nil {
+		t.Fatal("Remote memory revision reads returned nil collections")
+	}
 
 	checks := []struct {
 		name string
@@ -206,6 +240,10 @@ func TestRemoteUnsupportedCapabilitiesNeverFallBackToLocal(t *testing.T) {
 		{"remember for tab", func() error { _, err := app.RememberForTab("local-tab", "project", "local-only"); return err }},
 		{"forget", func() error { return app.Forget("local-only") }},
 		{"forget for tab", func() error { return app.ForgetForTab("local-tab", "local-only") }},
+		{"restore archived memory", func() error { _, err := app.RestoreArchivedMemory("local-only"); return err }},
+		{"restore archived memory for tab", func() error { _, err := app.RestoreArchivedMemoryForTab("local-tab", "local-only"); return err }},
+		{"restore memory revision", func() error { _, err := app.RestoreMemoryRevision("local-only", 1); return err }},
+		{"restore memory revision for tab", func() error { _, err := app.RestoreMemoryRevisionForTab("local-tab", "local-only", 1); return err }},
 		{"save doc", func() error { _, err := app.SaveDoc("REASONIX.md", "local-only"); return err }},
 		{"save doc for tab", func() error { _, err := app.SaveDocForTab("local-tab", "REASONIX.md", "local-only"); return err }},
 		{"accept memory suggestion", func() error { _, err := app.AcceptMemorySuggestion(MemorySuggestion{}); return err }},

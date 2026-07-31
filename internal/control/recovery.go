@@ -111,7 +111,7 @@ func (c *Controller) initRecoveryGate(reviewer recovery.Reviewer, headless bool)
 			msgs := c.executor.Session().Snapshot()
 			for i := len(msgs) - 1; i >= 0; i-- {
 				if string(msgs[i].Role) == "user" && strings.TrimSpace(msgs[i].Content) != "" {
-					text := strings.TrimSpace(msgs[i].Content)
+					text := agent.UserMessageText(msgs[i])
 					if len(text) > 800 {
 						return text[:800] + "…"
 					}
@@ -215,7 +215,8 @@ func (c *Controller) saveRecoveryState(path string) {
 	gate := c.recoveryGate
 	c.mu.Unlock()
 	if gate != nil {
-		if err := recovery.SaveSnapshot(path, gate.Snapshot()); err != nil {
+		// Persist evidence-only projection; never write active Episode locks.
+		if err := recovery.SaveSnapshot(path, gate.PersistenceSnapshot()); err != nil {
 			slog.Warn("controller: recovery snapshot", "err", err)
 		}
 	}
@@ -274,6 +275,7 @@ func (c *Controller) emitRecoveryPrompt(ctx context.Context, taskID string, pend
 		recoveryFirstNonEmpty(pending.Subject, pending.Tool),
 		recoveryFirstNonEmpty(pending.Rationale, "Auto Guard"),
 		true,
+		false,
 		recovery.ApprovalKindRecovery,
 		ev.Recovery,
 	)
@@ -312,4 +314,22 @@ func recoveryFirstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// beginRecoveryEpisode opens a fresh host-owned Recovery Episode. Failure,
+// reviewer, and stop budgets clear; explicit task grants survive. Safe to call
+// when recovery is disabled.
+func (c *Controller) beginRecoveryEpisode() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	gate := c.recoveryGate
+	c.mu.Unlock()
+	if gate == nil {
+		return
+	}
+	if ctrl, ok := any(gate).(agent.RecoveryEpisodeControl); ok {
+		ctrl.BeginEpisode()
+	}
 }

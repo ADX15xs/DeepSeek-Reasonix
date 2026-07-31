@@ -8,6 +8,7 @@ package permission
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"reasonix/internal/shellparse"
@@ -92,7 +93,54 @@ func ParseRule(s string) (Rule, bool) {
 		}
 		return Rule{Tool: tool, Subject: s[i+1 : len(s)-1]}, true
 	}
+	// Settings users saved these PowerShell file-writer cmdlets before the UI
+	// explained Bash(command:*) syntax. Migrate only that legacy set to shell
+	// prefixes so existing deny rules protect the real Bash call (#6950).
+	if isLegacyBarePowerShellRule(s) {
+		return Rule{Tool: "Bash", Subject: s + ":*"}, true
+	}
 	return Rule{Tool: s}, true
+}
+
+// isLegacyBarePowerShellRule is intentionally limited to the three rules users
+// reported saving through Settings before Bash(command:*) syntax was explained
+// there (#6950). Reinterpreting every Verb-Noun string would silently change
+// existing custom-tool rules in persisted configs.
+func isLegacyBarePowerShellRule(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "set-content", "add-content", "out-file":
+		return true
+	default:
+		return false
+	}
+}
+
+func isPowerShellCmdletName(s string) bool {
+	verb, noun, ok := strings.Cut(s, "-")
+	if !ok || verb == "" || noun == "" || strings.Contains(noun, "-") {
+		return false
+	}
+	switch strings.ToLower(verb) {
+	case "add", "clear", "close", "convertfrom", "convertto", "copy", "disable",
+		"enable", "enter", "exit", "export", "find", "format", "get", "grant",
+		"group", "import", "install", "invoke", "join", "lock", "measure",
+		"move", "new", "open", "optimize", "out", "publish", "read", "receive",
+		"register", "remove", "rename", "reset", "resize", "resolve", "restart",
+		"restore", "resume", "revoke", "save", "search", "select", "send", "set",
+		"show", "split", "start", "stop", "submit", "suspend", "sync", "test",
+		"trace", "unblock", "uninstall", "unlock", "unpublish", "unregister",
+		"update", "use", "wait", "watch", "write":
+	default:
+		return false
+	}
+	for _, part := range []string{verb, noun} {
+		for _, r := range part {
+			if (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func parseRules(ss []string) []Rule {
@@ -157,7 +205,7 @@ func (p Policy) ExplicitlyDenies(toolName string, args json.RawMessage) bool {
 		subjects = []string{""}
 	}
 	for _, subject := range subjects {
-		if matchAny(p.Deny, toolName, subject) {
+		if matchAnyRaw(p.Deny, toolName, subject) {
 			return true
 		}
 	}
@@ -168,18 +216,42 @@ func (p Policy) ExplicitlyDenies(toolName string, args json.RawMessage) bool {
 // stable approval subject from args.
 func (p Policy) DecideSubject(toolName string, readOnly bool, subject string) Decision {
 	if canonicalRuleTool(toolName) == "bash" {
+		approvalClass := classifyBashApproval(subject)
+		requiresExact := approvalClass != bashApprovalReusable
+		requiresHuman := approvalClass == bashApprovalRequireHuman
+		parts := DecomposeBashCommand(subject)
 		switch {
-		case matchAny(p.Deny, toolName, subject):
+		case matchAnyRaw(p.Deny, toolName, subject):
 			return Deny
-		case matchAny(p.SessionAllow, toolName, subject):
+		case matchAnyExact(p.SessionAllow, toolName, subject):
 			return Allow
-		case matchAny(p.Ask, toolName, subject):
+		case !requiresExact && parts == nil && matchAnyAllow(p.SessionAllow, toolName, subject):
+			return Allow
+		case matchAnyRaw(p.Ask, toolName, subject):
 			return Ask
-		case matchAny(p.Allow, toolName, subject):
+		case matchAnyExact(p.Allow, toolName, subject):
 			return Allow
 		}
-		if parts := DecomposeBashCommand(subject); parts != nil {
+		if parts != nil {
 			return p.decideBashSegments(readOnly, parts)
+		}
+		switch {
+		case requiresHuman && p.Mode == Deny:
+			return Deny
+		case requiresHuman:
+			return Ask
+		case requiresExact && readOnly:
+			return Allow
+		case requiresExact:
+			return p.Mode
+		}
+		switch {
+		case matchAnyAllow(p.Allow, toolName, subject):
+			return Allow
+		case readOnly:
+			return Allow
+		default:
+			return p.Mode
 		}
 	}
 	switch {
@@ -216,32 +288,13 @@ func (p Policy) decideBashSegments(readOnly bool, parts []string) Decision {
 	for _, sub := range parts {
 		segReadOnly := readOnly
 		if !segReadOnly {
-			if isReadOnlyBashSubject(sub) {
-				segReadOnly = true
-			}
+			segReadOnly = isReadOnlyBashSubject(sub)
 		}
-		switch {
-		case matchAny(p.Deny, "bash", sub):
+		switch p.DecideSubject("bash", segReadOnly, sub) {
+		case Deny:
 			return Deny
-		case matchAny(p.SessionAllow, "bash", sub):
-			// covered by the explicit session allowlist
-		case matchAny(p.Ask, "bash", sub):
+		case Ask:
 			out = Ask
-		case matchAny(p.Allow, "bash", sub):
-			// covered
-		case segReadOnly:
-			// covered
-		default:
-			// Segment not covered by a rule or read-only classification: apply
-			// the same writer fallback used for atomic bash commands.
-			switch p.Mode {
-			case Deny:
-				return Deny
-			case Ask:
-				out = Ask
-			default:
-				// covered by fallback allow
-			}
 		}
 	}
 	return out
@@ -287,12 +340,182 @@ func matchAny(rules []Rule, toolName, subject string) bool {
 	return false
 }
 
+func matchAnyRaw(rules []Rule, toolName, subject string) bool {
+	for _, r := range rules {
+		if !ruleToolMatches(r.Tool, toolName) {
+			continue
+		}
+		if r.Subject == "" {
+			return true
+		}
+		if subject == "" {
+			continue
+		}
+		if rawRuleSubjectMatches(r, subject) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstMatchingRule(rules []Rule, toolName, subject string, raw bool) (Rule, bool) {
+	for _, rule := range rules {
+		if !ruleToolMatches(rule.Tool, toolName) {
+			continue
+		}
+		if rule.Subject == "" {
+			return rule, true
+		}
+		if subject == "" {
+			continue
+		}
+		matches := ruleSubjectMatches(rule, subject)
+		if raw {
+			matches = rawRuleSubjectMatches(rule, subject)
+		}
+		if matches {
+			return rule, true
+		}
+	}
+	return Rule{}, false
+}
+
+func ruleConfigString(rule Rule) string {
+	if rule.Subject == "" {
+		return rule.Tool
+	}
+	if rule.Literal {
+		return rule.Tool + "=" + rule.Subject
+	}
+	return rule.Tool + "(" + rule.Subject + ")"
+}
+
+// MatchedRule reports the configured rule responsible for an explicit Ask or
+// Deny decision. Fallback-mode and dynamic-safety decisions intentionally have
+// no rule provenance. Compound Bash commands are inspected segment by segment
+// using the same raw-prefix semantics as DecideSubject.
+func (p Policy) MatchedRule(toolName string, decision Decision, args json.RawMessage) (string, bool) {
+	var rules []Rule
+	switch decision {
+	case Ask:
+		rules = p.Ask
+	case Deny:
+		rules = p.Deny
+	default:
+		return "", false
+	}
+	subjects := Subjects(args)
+	if len(subjects) == 0 {
+		subjects = []string{""}
+	}
+	raw := canonicalRuleTool(toolName) == "bash"
+	for _, subject := range subjects {
+		candidates := []string{subject}
+		if raw {
+			if parts := DecomposeBashCommand(subject); parts != nil {
+				candidates = append(candidates, parts...)
+			}
+		}
+		for _, candidate := range candidates {
+			// A matching configured rule is provenance only when that candidate's
+			// actual decision has the same outcome. SessionAllow may override an
+			// Ask rule on one endpoint while a different endpoint falls back to
+			// Ask; reporting the overridden rule would misstate why the call was
+			// stopped.
+			if p.DecideSubject(toolName, false, candidate) != decision {
+				continue
+			}
+			if rule, ok := firstMatchingRule(rules, toolName, candidate, raw); ok {
+				return ruleConfigString(rule), true
+			}
+		}
+	}
+	return "", false
+}
+
+func rawRuleSubjectMatches(rule Rule, subject string) bool {
+	if rule.Literal {
+		return rule.Subject == subject
+	}
+	if canonicalRuleTool(rule.Tool) == "bash" {
+		if base, ok := bashPrefixBase(rule.Subject); ok {
+			return rawBashPrefixMatches(base, subject)
+		}
+	}
+	return matchGlob(rule.Subject, subject)
+}
+
+func rawBashPrefixMatches(base, subject string) bool {
+	baseFields, malformed := shellparse.StaticFields(base)
+	if malformed == "" && len(baseFields) > 0 {
+		if features, ok := shellparse.AnalyzeApprovalFeatures(subject); ok && len(features.CommandPrefix) >= len(baseFields) {
+			matched := true
+			for i, want := range baseFields {
+				got := features.CommandPrefix[i]
+				if got != want && !(i == 0 && isPowerShellCmdletName(want) && strings.EqualFold(got, want)) {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				return true
+			}
+		}
+	}
+	base = strings.TrimSpace(base)
+	subject = strings.TrimSpace(subject)
+	if subject == base || (isPowerShellCmdletName(base) && strings.EqualFold(subject, base)) {
+		return true
+	}
+	if len(subject) <= len(base) {
+		return false
+	}
+	prefixMatches := strings.HasPrefix(subject, base)
+	if isPowerShellCmdletName(base) {
+		prefixMatches = strings.EqualFold(subject[:len(base)], base)
+	}
+	if !prefixMatches {
+		return false
+	}
+	switch subject[len(base)] {
+	case ' ', '\t', '\r', '\n':
+		return true
+	default:
+		return false
+	}
+}
+
+func matchAnyExact(rules []Rule, toolName, subject string) bool {
+	if subject == "" {
+		return false
+	}
+	for _, r := range rules {
+		if !ruleToolMatches(r.Tool, toolName) || r.Subject == "" {
+			continue
+		}
+		if r.Subject == subject && (r.Literal || !hasGlobMeta(r.Subject)) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchAnyAllow(rules []Rule, toolName, subject string) bool {
+	if matchAnyExact(rules, toolName, subject) {
+		return true
+	}
+	if canonicalRuleTool(toolName) == "bash" && bashSubjectRequiresExactRule(subject) {
+		return false
+	}
+	return matchAny(rules, toolName, subject)
+}
+
 // RuleMatchesString reports whether one config-style rule string matches the
 // given tool subject. It is used for session grants as well as persisted config
 // rules so both paths share identical matching semantics.
 func RuleMatchesString(rule, toolName, subject string) bool {
 	r, ok := ParseRule(rule)
-	return ok && matchAny([]Rule{r}, toolName, subject)
+	return ok && matchAnyAllow([]Rule{r}, toolName, subject)
 }
 
 // RuleCoversString reports whether every call represented by candidate is
@@ -311,11 +534,14 @@ func RuleCoversString(existing, candidate string) bool {
 	if !ruleToolCompatible(a.Tool, b.Tool) {
 		return false
 	}
+	if b.Subject == "" {
+		return a.Subject == ""
+	}
+	if canonicalRuleTool(b.Tool) == "bash" && (b.Literal || !hasGlobMeta(b.Subject)) && bashSubjectRequiresExactRule(b.Subject) {
+		return matchAnyExact([]Rule{a}, canonicalRuleTool(b.Tool), b.Subject)
+	}
 	if a.Subject == "" {
 		return true
-	}
-	if b.Subject == "" {
-		return false
 	}
 	if bashRulePrefixBaseMatches(a, b) {
 		return true
@@ -407,13 +633,13 @@ func matchGlob(pattern, name string) bool {
 	starPx = -1
 	for nx < len(name) {
 		switch {
-		case px < len(pattern) && (pattern[px] == '?' || pattern[px] == name[nx]):
-			px++
-			nx++
 		case px < len(pattern) && pattern[px] == '*':
 			starPx = px
 			starNx = nx
 			px++
+		case px < len(pattern) && (pattern[px] == '?' || pattern[px] == name[nx]):
+			px++
+			nx++
 		case starPx != -1:
 			px = starPx + 1
 			starNx++
@@ -444,6 +670,13 @@ type ReasonedApprover interface {
 	ApproveWithReason(ctx context.Context, toolName, subject string, args json.RawMessage) (allow, remember bool, reason string, err error)
 }
 
+// PolicyReasonedApprover receives the explicit permission-rule provenance that
+// caused an Ask decision. Frontends can display it without duplicating Policy
+// matching logic; older Approver implementations remain source-compatible.
+type PolicyReasonedApprover interface {
+	ApproveWithPolicyReason(ctx context.Context, toolName, subject string, args json.RawMessage, policyReason string) (allow, remember bool, reason string, err error)
+}
+
 // Gate is what the agent consults at execute time: a Policy plus an optional
 // Approver. It satisfies the agent's Gate interface structurally.
 type Gate struct {
@@ -467,15 +700,24 @@ func (g *Gate) Check(ctx context.Context, toolName string, args json.RawMessage,
 			readOnly = true
 		}
 	}
-	switch g.Policy.Decide(toolName, readOnly, args) {
+	decision := g.Policy.Decide(toolName, readOnly, args)
+	ruleReason := ""
+	if rule, ok := g.Policy.MatchedRule(toolName, decision, args); ok {
+		ruleReason = fmt.Sprintf("Matched permission rule: %s %s", decision, rule)
+	}
+	switch decision {
 	case Deny:
-		return false, "denied by permission policy — this tool/command is on the deny list. Do not retry it; choose another approach or stop and explain.", nil
+		reason := "denied by permission policy — this tool/command is on the deny list. Do not retry it; choose another approach or stop and explain."
+		if ruleReason != "" {
+			reason = ruleReason + "\n" + reason
+		}
+		return false, reason, nil
 	case Ask:
 		if g.Approver == nil {
 			return true, "", nil // non-interactive: preserve autonomy
 		}
 		subject := Subject(args)
-		allow, remember, approverReason, err := g.approve(ctx, toolName, subject, args)
+		allow, remember, approverReason, err := g.approve(ctx, toolName, subject, args, ruleReason)
 		if err != nil {
 			return false, "approval aborted", err
 		}
@@ -513,7 +755,10 @@ func (g *Gate) ExplicitlyDenies(toolName string, args json.RawMessage) bool {
 	return g.Policy.ExplicitlyDenies(toolName, args)
 }
 
-func (g *Gate) approve(ctx context.Context, toolName, subject string, args json.RawMessage) (bool, bool, string, error) {
+func (g *Gate) approve(ctx context.Context, toolName, subject string, args json.RawMessage, policyReason string) (bool, bool, string, error) {
+	if a, ok := g.Approver.(PolicyReasonedApprover); ok {
+		return a.ApproveWithPolicyReason(ctx, toolName, subject, args, policyReason)
+	}
 	if a, ok := g.Approver.(ReasonedApprover); ok {
 		return a.ApproveWithReason(ctx, toolName, subject, args)
 	}
@@ -542,7 +787,7 @@ func RememberRuleForScope(toolName, subject string) string {
 		if pattern := BashCommandPrefix(subject); pattern != "" {
 			return "Bash(" + pattern + ")"
 		}
-		return "Bash(" + subject + ")"
+		return "Bash=" + subject
 	}
 	if IsFileMutationTool(toolName) {
 		return "Edit"
@@ -566,7 +811,7 @@ func SessionGrantRuleForScope(toolName, subject string) string {
 		if pattern := BashCommandPrefix(subject); pattern != "" {
 			return "Bash(" + pattern + ")"
 		}
-		return "Bash(" + subject + ")"
+		return "Bash=" + subject
 	}
 	if IsFileMutationTool(toolName) {
 		return "Edit"
@@ -580,7 +825,7 @@ func SessionGrantRuleForScope(toolName, subject string) string {
 // broader "go *".
 func BashCommandPrefix(subject string) string {
 	cmd := strings.TrimSpace(subject)
-	if cmd == "" || containsShellSyntax(cmd) {
+	if cmd == "" || containsShellSyntax(cmd) || bashSubjectRequiresExactRule(cmd) {
 		return ""
 	}
 	if BashDangerWarning(cmd) != "" {

@@ -334,6 +334,7 @@ type TodoStepMatch struct {
 type Receipt struct {
 	ToolName  string          `json:"tool_name"`
 	Args      json.RawMessage `json:"args,omitempty"`
+	Profile   string          `json:"profile,omitempty"`
 	Success   bool            `json:"success"`
 	Command   string          `json:"command,omitempty"`
 	Step      string          `json:"step,omitempty"`
@@ -558,6 +559,70 @@ func (l *Ledger) HasSuccessfulCommand(command string) bool {
 		}
 	}
 	return false
+}
+
+// HasCompletedReview reports whether a review completed with evidence that is
+// fresh for the latest mutation. Structured review_report receipts are the
+// strongest proof and also cover collected background reviews. Foreground
+// review/task adapters remain compatible, but after a mutation their child
+// receipts must show that the changed result was actually inspected.
+func (l *Ledger) HasCompletedReview() bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	receipts := append([]Receipt(nil), l.receipts...)
+	l.mu.Unlock()
+
+	mutation := -1
+	for i, r := range receipts {
+		if r.Success && r.Mutation {
+			mutation = i
+		}
+	}
+	start := mutation + 1
+	requiredPaths := []string(nil)
+	if mutation >= 0 {
+		requiredPaths = receipts[mutation].Paths
+	}
+
+	for i := start; i < len(receipts); i++ {
+		r := receipts[i]
+		if completedStructuredReviewReceipt(r, requiredPaths) {
+			return true
+		}
+		if !successfulForegroundReviewReceipt(r) {
+			continue
+		}
+		if mutation < 0 || receiptsReviewChanges(receipts, start, i, mutation) {
+			return true
+		}
+	}
+	return false
+}
+
+func successfulForegroundReviewReceipt(r Receipt) bool {
+	if !r.Success {
+		return false
+	}
+	if r.ToolName == "review" {
+		return true
+	}
+	if r.ToolName != "task" || r.Profile != "review" {
+		return false
+	}
+	var p struct {
+		RunInBackground bool `json:"run_in_background"`
+	}
+	return json.Unmarshal(r.Args, &p) == nil && !p.RunInBackground
+}
+
+func completedStructuredReviewReceipt(r Receipt, requiredPaths []string) bool {
+	if !r.Success || r.ToolName != "review_report" {
+		return false
+	}
+	report, err := ParseReviewReport(r.Args)
+	return err == nil && report.Kind == ReviewKindReview && report.CoversPaths(requiredPaths)
 }
 
 // HasFailedCommand reports whether the cited command ran this turn but exited
@@ -1372,6 +1437,9 @@ func ReceiptFromToolCall(toolName string, args json.RawMessage, success bool, re
 		if toolName == "bash" {
 			r.Command = stringField(fields, "command")
 		}
+		if toolName == "task" {
+			r.Profile = stringField(fields, "profile")
+		}
 		if toolName == "complete_step" {
 			r.Step = completeStepIdentity(fields)
 			r.StepProof = completeStepHasProof(fields)
@@ -1668,6 +1736,8 @@ func bashSegmentIsVerification(fields []string) bool {
 			return true
 		}
 		return len(args) > 1 && args[0] == "run" && hasCommandArg(args[1:2], "test", "check", "lint", "typecheck")
+	case "npx":
+		return npxSegmentIsVerification(args)
 	case "node":
 		return nodeSegmentIsVerification(args)
 	case "make", "just":
@@ -1680,6 +1750,43 @@ func bashSegmentIsVerification(fields []string) bool {
 		return len(args) > 0 && hasCommandArg(args, "test", "check", "verify")
 	}
 	return false
+}
+
+// npxSegmentIsVerification unwraps only known test runners invoked directly,
+// with no npx control flags. Treating arbitrary npx packages as verification
+// would let package installation or an opaque executable masquerade as a
+// read-only check. Runner flags that update snapshots, write reports, or enable
+// coverage are rejected by the caller and the checks below.
+func npxSegmentIsVerification(args []string) bool {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return false
+	}
+	runner := strings.ToLower(filepath.Base(args[0]))
+	if strings.HasPrefix(runner, "@") {
+		return false
+	}
+	if i := strings.LastIndexByte(runner, '@'); i > 0 {
+		runner = runner[:i]
+	}
+	switch runner {
+	case "vitest", "jest":
+	default:
+		return false
+	}
+	for _, arg := range args[1:] {
+		name := strings.ToLower(arg)
+		if i := strings.IndexByte(name, '='); i >= 0 {
+			name = name[:i]
+		}
+		switch name {
+		case "--update", "-u", "--updatesnapshot":
+			return false
+		}
+		if name == "--coverage" || strings.HasPrefix(name, "--coverage=") || strings.HasPrefix(name, "--coverage.") {
+			return false
+		}
+	}
+	return true
 }
 
 func nodeSegmentIsVerification(args []string) bool {

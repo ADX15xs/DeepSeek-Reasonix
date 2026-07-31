@@ -1,6 +1,8 @@
 // Wire contract — mirrors desktop/wire.go (itself mirroring internal/serve/wire.go).
 // One event channel carries every kind; `kind` discriminates the payload.
 
+import type { Todo } from "./tools";
+
 export type EventKind =
   | "turn_started"
   | "reasoning"
@@ -38,6 +40,8 @@ export interface WireTool {
   id?: string;
   name: string;
   args?: string;
+  resolvedName?: string;
+  capabilityId?: string;
   output?: string;
   err?: string;
   readOnly: boolean;
@@ -171,19 +175,37 @@ export interface WireEvent {
   compaction?: WireCompaction;
   guardian?: WireGuardian;
   err?: string;
-  outcome?: "final_readiness";
+  outcome?: "final_readiness" | "recovery_paused";
   readiness?: WireFinalReadiness;
   retryAttempt?: number;
   retryMax?: number;
   // Tab routing: set by the Go-side tabEventSink so multi-tab frontends
   // route each event to the correct per-tab reducer.
   tabId?: string;
+  runtimeEpoch?: string;
   sessionHitTokens?: number;
   sessionMissTokens?: number;
   sessionCost?: number;
   sessionCurrency?: string;
   // Deprecated compatibility alias. Prefer sessionCost + sessionCurrency.
   sessionCostUsd?: number;
+}
+
+export type SessionRuntimePhase = "starting" | "ready" | "lease_blocked" | "failed" | "closing";
+
+export interface SessionRuntimeIssue {
+  code: "session_lease_held" | "startup_failed";
+  message: string;
+  retryable: boolean;
+  holderPid?: number;
+  holderHost?: string;
+  acquiredAt?: string;
+}
+
+export interface SessionRuntimeView {
+  phase: SessionRuntimePhase;
+  epoch: string;
+  issue?: SessionRuntimeIssue;
 }
 
 export interface WireFinalReadiness {
@@ -209,6 +231,7 @@ export interface TabMeta {
   projectColor?: string;
   label: string;
   ready: boolean;
+  runtime?: SessionRuntimeView;
   running: boolean;
   pendingPrompt?: boolean;
   backgroundJobs?: number;
@@ -228,6 +251,29 @@ export interface TabMeta {
   startupErr?: string;
   active: boolean;
   cwd: string;
+}
+
+export interface TerminalSessionView {
+  id: string;
+  title: string;
+  shell: string;
+  cwd: string;
+  createdAt: number;
+  exitCode?: number;
+  running: boolean;
+}
+
+export interface TerminalShellView {
+  id: string;
+  label: string;
+}
+
+export interface TerminalWorkspaceView {
+  available: boolean;
+  readOnly: boolean;
+  reason?: string;
+  sessions: TerminalSessionView[];
+  shells: TerminalShellView[];
 }
 
 export interface ProjectNode {
@@ -380,6 +426,9 @@ export interface HistoryToolCall {
   id: string;
   name: string;
   arguments: string;
+  resolvedName?: string;
+  capabilityId?: string;
+  resolvedReadOnly?: boolean;
   subject?: string;
   summary?: string;
   diff?: string;
@@ -482,6 +531,7 @@ export interface ContextInfo {
 export interface Meta {
   label: string;
   ready: boolean;
+  runtime?: SessionRuntimeView;
   startupErr?: string;
   eventChannel: string;
   cwd: string;
@@ -499,6 +549,7 @@ export interface Meta {
   goal?: string;
   goalStatus?: GoalStatus;
   autoResearch?: AutoResearchCompactView;
+  canonicalTodos?: Todo[];
 }
 
 export type CollaborationMode = "normal" | "plan" | "goal";
@@ -704,11 +755,21 @@ export interface ServerView {
   name: string;
   transport: string;
   status: "connected" | "deferred" | "failed" | "initializing" | "disabled";
+  /** @deprecated derived from enabled */
   startIntent?: "off" | "automatic" | string;
   runtimeState?: "idle" | "connecting" | "ready" | "issue" | string;
+  /** Product availability: available_on_demand | starting | connected | auth_required | project_auth_changed | start_failed | disabled */
+  availability?: string;
+  enabled?: boolean;
+  installed?: boolean;
+  action?: "none" | "authenticate" | "authorize" | "retry" | string;
+  source?: "project" | "user" | "plugin" | "builtin" | string;
+  configSource?: string;
   builtIn?: boolean;
   configured?: boolean;
+  /** @deprecated same as enabled */
   autoStart: boolean;
+  /** @deprecated ignored by runtime */
   tier?: "background" | "eager" | string;
   command?: string;
   args?: string[];
@@ -716,6 +777,7 @@ export interface ServerView {
   envKeys?: string[];
   headerKeys?: string[];
   tools: number;
+  toolCount?: number;
   prompts: number;
   resources: number;
   hasTools?: boolean;
@@ -886,6 +948,14 @@ export interface MCPServerInput {
   toolTimeoutSeconds?: Record<string, number> | null;
 }
 
+export interface MCPInstallResult {
+  name: string;
+  state: "ready" | "action_required" | "issue";
+  toolCount: number;
+  action: "none" | "authenticate" | "authorize" | "retry";
+  message: string;
+}
+
 export interface MCPMarketplaceEntry {
   name: string;
   suggestedName: string;
@@ -938,15 +1008,65 @@ export interface SlashArgsResult {
 export interface MemoryDoc {
   path: string;
   scope: string; // "user" | "ancestor" | "project" | "local"
+  directory?: string;
   body: string;
+  imports: Array<{ path: string; sourcePath: string }>;
+  depth: number;
+  order: number;
+  precedence: number;
+}
+
+export interface InstructionDiagnostic {
+  code: string;
+  path: string;
+  sourcePath?: string;
+  line?: number;
+  message: string;
 }
 
 export interface MemoryFact {
+  id?: string;
+  revision?: number;
+  createdAt?: string;
+  updatedAt?: string;
   name: string;
   title?: string;
   description: string;
   type: string; // "user" | "feedback" | "project" | "reference"
+  scope: string; // "project" | "global"
   body: string;
+  freshness: string; // "fresh" | "current" | "stale"
+}
+
+export interface MemoryConflict {
+  key: string;
+  projectId: string;
+  projectName: string;
+  globalId: string;
+  globalName: string;
+  resolution: "project_over_global";
+}
+
+export interface MemoryRecallHit {
+  id: string;
+  revision: number;
+  name: string;
+  title?: string;
+  type: string;
+  scope: string;
+  score: number;
+  freshness: string;
+  reason: string;
+  snippet: string;
+}
+
+export interface MemoryRecallTrace {
+  query: string;
+  hits: MemoryRecallHit[];
+  omitted: number;
+  charBudget: number;
+  usedChars: number;
+  suppressed?: string;
 }
 
 export interface MemoryArchive extends MemoryFact {
@@ -965,6 +1085,7 @@ export interface MemorySuggestion {
   title: string;
   description: string;
   type: string;
+  scope: string; // "project" | "global"
   body: string;
   reason: string;
   evidence: string[];
@@ -993,6 +1114,9 @@ export interface MemoryView {
   facts: MemoryFact[];
   archives: MemoryArchive[];
   scopes: MemoryScope[];
+  instructionDiagnostics: InstructionDiagnostic[];
+  conflicts: MemoryConflict[];
+  lastRecall: MemoryRecallTrace;
   storeDir: string;
   storeGlobalDir?: string;
   available: boolean;
@@ -1165,7 +1289,7 @@ export interface CapabilityDiagnosticsReport {
     plugins: number;
     mcp_servers: number;
   };
-  instructions: { docs: Array<{ path: string; scope: string; order: number }> };
+  instructions: { docs: Array<{ path: string; scope: string; directory?: string; depth: number; order: number }> };
   skills: CapabilityAssetReport;
   commands: CapabilityAssetReport;
   hooks: {
@@ -1591,6 +1715,7 @@ export interface SettingsView {
   agent: AgentView;
   bot: BotSettingsView;
   desktopLanguage: string; // "" | "en" | "zh"; empty = auto
+  desktopCurrency?: string; // "" | "CNY" | "USD"; absent/empty = follow language
   desktopLayoutStyle: string; // "classic" | "workbench" | "creation"
   desktopTheme: string; // "auto" | "dark" | "light"
   desktopThemeStyle: string;
@@ -1600,8 +1725,9 @@ export interface SettingsView {
   statusBarItems: string[]; // ordered visible status bar item ids
   defaultToolApprovalMode: ToolApprovalMode | string; // default for newly-created sessions
   checkUpdates: boolean; // check for new versions on startup
-  telemetry: boolean; // anonymous launch ping (install id + version + OS)
-  metrics: boolean; // aggregate desktop metrics (anonymous signal/bucket counts)
+  updateChannel: string; // "stable" | "preview"
+  telemetry: boolean; // anonymous launch ping + scrubbed next-launch native crash diagnostics
+  metrics: boolean; // aggregate quality/lifecycle metrics (anonymous signal/bucket counts)
   configPath: string;
   providerKinds: string[]; // provider implementations the kernel registered (for the kind picker)
   autoApproveTools: boolean;
@@ -1619,6 +1745,7 @@ export interface DesktopStartupSettingsView {
   statusBarStyle: string; // "icon" | "text"
   statusBarItems: string[]; // ordered visible status bar item ids
   checkUpdates: boolean; // check for new versions on startup
+  updateChannel: string; // "stable" | "preview"
   safeMode?: boolean; // recovery startup with external integrations disabled
   conversationWidth?: string; // "standard" | "full"; absent from older Wails payloads
 }
@@ -1648,6 +1775,8 @@ export interface UpdateInfo {
   canSelfUpdate: boolean; // macOS true only for signed/notarized builds
   manualOnly?: boolean;
   manualReason?: string;
+  installMode?: "portable" | "deb" | "manual" | string;
+  requiresElevation?: boolean;
   downloaded: boolean;
   downloadUrl: string; // human-facing releases page (macOS path / fallback link)
   assetSize: number; // running platform's artifact size, for the progress bar
@@ -1655,6 +1784,7 @@ export interface UpdateInfo {
 }
 
 export interface UpdateDownloadResult {
+  requestId: string;
   version: string;
   channel: string;
   path: string;
@@ -1663,7 +1793,10 @@ export interface UpdateDownloadResult {
 }
 
 export interface UpdateProgress {
-  phase: "downloading" | "verifying" | "downloaded" | "installing" | "done" | "error";
+  requestId: string;
+  version: string;
+  channel: "stable" | "preview" | string;
+  phase: "downloading" | "verifying" | "downloaded" | "authorizing" | "installing" | "done" | "error";
   received: number;
   total: number;
   err?: string;
