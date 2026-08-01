@@ -648,14 +648,15 @@ func (c *Controller) rebindCheckpoints(sessionPath string) {
 	c.checkpoints.rebind(ckptDir(sessionPath), c.workspaceRoot)
 }
 
-// beginCheckpoint opens a checkpoint for the turn about to run, recording the
-// current message count as the conversation-rewind boundary. Called at the top of
-// runTurn, before the user message is appended.
+// beginCheckpoint opens a checkpoint for the turn about to run, called at the top of
+// runTurn before the user message is appended. The input is stripped of transient
+// controller-injected blocks so the rewind picker and session preview show only the
+// user's authored text.
 func (c *Controller) beginCheckpoint(input string) {
 	if c.executor == nil {
 		return
 	}
-	c.checkpoints.begin(input, len(c.executor.Session().Messages))
+	c.checkpoints.begin(agent.StripTransientUserBlocks(input), len(c.executor.Session().Messages))
 }
 
 // --- commands (frontend → controller) ---

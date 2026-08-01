@@ -669,6 +669,44 @@ func TestTurnOrchestratorSyntheticTurnDoesNotCreateCheckpoint(t *testing.T) {
 	}
 }
 
+func TestTurnOrchestratorCheckpointPromptStripsReasoningLanguage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	sess := agent.NewSession("sys")
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	runner := &recordingSessionRunner{session: sess}
+	c := New(Options{
+		Runner:      runner,
+		Executor:    exec,
+		SessionDir:  dir,
+		SessionPath: path,
+		Label:       "test",
+	})
+
+	// A Chinese prompt triggers auto reasoning-language injection (<reasoning-language>…)
+	// in the composed model input, but the checkpoint Prompt label must hold only the
+	// user-authored text so /rewind and session previews stay readable.
+	const visible = "帮我修复这个报错"
+	o := newTurnOrchestrator(c)
+	if err := o.runTurnWithRawDisplay(context.Background(), visible, visible, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	cps := c.Checkpoints()
+	if len(cps) != 1 {
+		t.Fatalf("checkpoints = %+v, want exactly 1", cps)
+	}
+	if strings.Contains(cps[0].Prompt, "<reasoning-language>") {
+		t.Fatalf("checkpoint Prompt leaked reasoning-language block: %q", cps[0].Prompt)
+	}
+	if strings.Contains(cps[0].Prompt, "<response-language>") {
+		t.Fatalf("checkpoint Prompt leaked response-language block: %q", cps[0].Prompt)
+	}
+	if cps[0].Prompt != visible {
+		t.Fatalf("checkpoint Prompt = %q, want %q", cps[0].Prompt, visible)
+	}
+}
+
 func TestTurnOrchestratorStopFailureHookCancelledContext(t *testing.T) {
 	prov := &scriptedTurns{turns: [][]provider.Chunk{textTurn("done")}}
 	ag := agent.New(prov, tool.NewRegistry(), agent.NewSession(""), agent.Options{}, event.Discard)

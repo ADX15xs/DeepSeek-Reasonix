@@ -379,7 +379,7 @@ func cleanExtraBody(in map[string]any) map[string]any {
 
 func reservedExtraBodyField(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "model", "messages", "tools", "stream", "stream_options", "temperature", "max_tokens", "reasoning_effort", "thinking":
+	case "model", "messages", "tools", "stream", "stream_options", "temperature", "reasoning_effort", "thinking":
 		return true
 	default:
 		return false
