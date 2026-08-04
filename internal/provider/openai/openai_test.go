@@ -688,8 +688,12 @@ func TestStreamSendsExtraBody(t *testing.T) {
 			http.Error(w, "extra top_p missing", http.StatusBadRequest)
 			return
 		}
-		if got, ok := req["max_tokens"].(float64); !ok || got != 8192 {
-			http.Error(w, "extra max_tokens missing or wrong", http.StatusBadRequest)
+		if got, ok := req["max_tokens"].(float64); !ok || got != 4096 {
+			http.Error(w, "provider budget not injected / extra_body max_tokens leaked", http.StatusBadRequest)
+			return
+		}
+		if req["max_output_tokens"] != nil {
+			http.Error(w, "reserved max_output_tokens leaked from extra_body", http.StatusBadRequest)
 			return
 		}
 		if req["model"] != "model-a" || req["stream"] != true {
@@ -706,13 +710,16 @@ func TestStreamSendsExtraBody(t *testing.T) {
 		BaseURL: srv.URL,
 		Model:   "model-a",
 		APIKey:  "real-key",
-		Extra: map[string]any{"extra_body": map[string]any{
-			"enable_thinking": true,
-			"top_p":           0.7,
-			"max_tokens":      8192,
-			"model":           "wrong",
-			"stream":          false,
-		}},
+		Extra: map[string]any{
+			"max_output_tokens": 4096,
+			"extra_body": map[string]any{
+				"enable_thinking": true,
+				"top_p":           0.7,
+				"max_tokens":      8192,
+				"model":           "wrong",
+				"stream":          false,
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
