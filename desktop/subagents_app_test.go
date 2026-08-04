@@ -530,6 +530,31 @@ func TestTrySubagentProfileRejectsUnknownModel(t *testing.T) {
 	}
 }
 
+func TestTrySubagentPermissionGateFailsClosedOnAsk(t *testing.T) {
+	cfg := config.Default()
+	cfg.Permissions.Ask = []string{"read_file"}
+	policy := permission.New(cfg.Permissions.Mode, cfg.Permissions.Allow, cfg.Permissions.Ask, cfg.Permissions.Deny).
+		WithAllowDynamicBashFallback(cfg.Permissions.AllowDynamicBash)
+	gate := trySubagentPermissionGate(policy)
+
+	allow, reason, err := gate.Check(context.Background(), "read_file", json.RawMessage(`{"path":"README.md"}`), true)
+	if err != nil {
+		t.Fatalf("ask decision returned an error instead of a denial: %v", err)
+	}
+	if allow || (!strings.Contains(strings.ToLower(reason), "denied") &&
+		!strings.Contains(strings.ToLower(reason), "declined")) {
+		t.Fatalf("explicit Ask decision allow=%v reason=%q, want fail-closed denial", allow, reason)
+	}
+
+	cfg.Permissions.Ask = nil
+	policy = permission.New(cfg.Permissions.Mode, cfg.Permissions.Allow, cfg.Permissions.Ask, cfg.Permissions.Deny).
+		WithAllowDynamicBashFallback(cfg.Permissions.AllowDynamicBash)
+	allow, reason, err = trySubagentPermissionGate(policy).Check(context.Background(), "read_file", json.RawMessage(`{"path":"README.md"}`), true)
+	if err != nil || !allow {
+		t.Fatalf("ordinary read-only fallback allow=%v reason=%q err=%v, want allowed", allow, reason, err)
+	}
+}
+
 func TestDeleteSubagentProfileRemovesIt(t *testing.T) {
 	a := newTestSubagentApp(t)
 	if _, err := a.CreateSubagentProfile(SubagentProfileInput{

@@ -23,6 +23,7 @@ const (
 	legacyLongCat20ContextWindow = 131_072
 	longCatOpenAIBaseURL         = "https://api.longcat.chat/openai/v1"
 	longCatAnthropicBaseURL      = "https://api.longcat.chat/anthropic"
+	deepSeekAnthropicBaseURL     = "https://api.deepseek.com/anthropic"
 )
 
 // CuratedProviderPresets returns one-click provider templates for common
@@ -50,9 +51,15 @@ func CuratedProviderPreset(id string) (ProviderPreset, bool) {
 
 func providerPresetDisplayRank(id string) int {
 	switch {
+	case id == "deepseek-responses":
+		return -1
+	case id == "deepseek-anthropic":
+		return 0
 	case id == "glm-cn" || id == "zai-global" || strings.HasPrefix(id, "glm-coding-plan-") || strings.HasPrefix(id, "zai-coding-plan-"):
 		return 0
 	case strings.HasPrefix(id, "longcat-"):
+		return 1
+	case id == "token-rhythm":
 		return 1
 	case strings.HasPrefix(id, "kimi-"):
 		return 2
@@ -69,13 +76,22 @@ var (
 	kimiAPIVisionModels = []string{"kimi-k3", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6", "kimi-k2.5"}
 	kimiCodingModels    = []string{"kimi-for-coding"}
 
-	longCat20Models = []string{"LongCat-2.0"}
+	longCat20Models   = []string{"LongCat-2.0"}
+	deepSeekV4Models  = []string{"deepseek-v4-flash", "deepseek-v4-pro"}
+	tokenRhythmModels = []string{
+		"deepseek-v4-flash", "deepseek-v4-pro", "glm-5", "glm-5.1",
+		"minimax-m2.7", "kimi-k2.5", "kimi-k2.6", "minimax-m2.5",
+		"mimo-v2.5-pro", "qwen3.7-max", "kimi-k2.7-code", "glm-5.2",
+		"qwen3.8-max", "deepseek-v4-flash-0731",
+	}
+	tokenRhythmVisionModels = []string{"kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code"}
 
 	mimoV25Models       = []string{"mimo-v2.5-pro", "mimo-v2.5"}
 	mimoV25VisionModels = []string{"mimo-v2.5"}
 
 	minimaxMSeriesModels       = []string{"MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"}
 	minimaxMSeriesVisionModels = []string{"MiniMax-M3"}
+	deepSeekResponsesModels    = []string{"deepseek-v4-flash"}
 
 	glmAPIModels       = []string{"glm-5.2", "glm-5.1", "glm-5", "glm-5-turbo", "glm-5v-turbo", "glm-4.7", "glm-4.7-flash", "glm-4.7-flashx", "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.5-flash"}
 	glmAPIVisionModels = []string{"glm-5v-turbo"}
@@ -115,6 +131,48 @@ func qwenModelContextOverrides() map[string]ProviderModelOverride {
 	}
 }
 
+func tokenRhythmModelOverrides() map[string]ProviderModelOverride {
+	return map[string]ProviderModelOverride{
+		"deepseek-v4-flash": {
+			ReasoningProtocol: ReasoningProtocolDeepSeek,
+			SupportedEfforts:  []string{"disabled", "low", "high", "max"},
+			DefaultEffort:     "high",
+		},
+		"deepseek-v4-pro": {
+			ReasoningProtocol: ReasoningProtocolDeepSeek,
+			SupportedEfforts:  []string{"disabled", "high", "max"},
+			DefaultEffort:     "high",
+		},
+		"deepseek-v4-flash-0731": {
+			ReasoningProtocol: ReasoningProtocolDeepSeek,
+			SupportedEfforts:  []string{"disabled", "low", "high", "max"},
+			DefaultEffort:     "high",
+		},
+		"glm-5": {
+			ReasoningProtocol: ReasoningProtocolGLM,
+			SupportedEfforts:  []string{"enabled", "disabled"},
+			DefaultEffort:     "enabled",
+		},
+		"glm-5.1": {
+			ReasoningProtocol: ReasoningProtocolGLM,
+			SupportedEfforts:  []string{"enabled", "disabled"},
+			DefaultEffort:     "enabled",
+			ContextWindow:     200_000,
+		},
+		"glm-5.2": {
+			ReasoningProtocol: ReasoningProtocolGLM,
+			SupportedEfforts:  []string{"enabled", "disabled"},
+			DefaultEffort:     "enabled",
+		},
+		"minimax-m2.7":   {ContextWindow: 200_000},
+		"kimi-k2.5":      {ContextWindow: 256_000},
+		"kimi-k2.6":      {ContextWindow: 256_000},
+		"minimax-m2.5":   {ContextWindow: 200_000},
+		"mimo-v2.5-pro":  {ContextWindow: 256_000},
+		"kimi-k2.7-code": {ContextWindow: 256_000},
+	}
+}
+
 func kimiK3DirectOverride() ProviderModelOverride {
 	return ProviderModelOverride{
 		ReasoningProtocol: ReasoningProtocolOpenAI,
@@ -125,6 +183,28 @@ func kimiK3DirectOverride() ProviderModelOverride {
 }
 
 var curatedProviderPresets = []ProviderPreset{
+	{
+		ID:          "deepseek-anthropic",
+		Label:       "DeepSeek Anthropic",
+		Description: "Optional official DeepSeek Anthropic-compatible endpoint; Chat Completions remains the default.",
+		KeyEnv:      "DEEPSEEK_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:          "deepseek-anthropic",
+			Kind:          "anthropic",
+			BaseURL:       deepSeekAnthropicBaseURL,
+			Models:        deepSeekV4Models,
+			Default:       "deepseek-v4-flash",
+			APIKeyEnv:     "DEEPSEEK_API_KEY",
+			BalanceURL:    "https://api.deepseek.com/user/balance",
+			Thinking:      "enabled",
+			ContextWindow: 1_000_000,
+			Prices:        deepSeekV4PricesUSD(),
+			ModelOverrides: map[string]ProviderModelOverride{
+				"deepseek-v4-flash": {SupportedEfforts: []string{"disabled", "low", "high", "max"}, DefaultEffort: "high"},
+				"deepseek-v4-pro":   {SupportedEfforts: []string{"disabled", "high", "max"}, DefaultEffort: "high"},
+			},
+		}},
+	},
 	{
 		ID:          "longcat-openai",
 		Label:       "LongCat OpenAI",
@@ -164,6 +244,24 @@ var curatedProviderPresets = []ProviderPreset{
 			DefaultEffort:    "enabled",
 			ContextWindow:    longCat20ContextWindow,
 			Prices:           longCat20Prices(longCat20Models),
+		}},
+	},
+	{
+		ID:          "token-rhythm",
+		Label:       "Token Rhythm",
+		Description: "Token Rhythm (基元律动) multi-model OpenAI-compatible gateway.",
+		KeyEnv:      "TOKEN_RHYTHM_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:           "token-rhythm",
+			Kind:           "openai",
+			BaseURL:        "https://tokenrhythm.studio/v1",
+			ModelsURL:      "https://tokenrhythm.studio/v1/models",
+			Models:         tokenRhythmModels,
+			VisionModels:   tokenRhythmVisionModels,
+			Default:        "deepseek-v4-flash",
+			APIKeyEnv:      "TOKEN_RHYTHM_API_KEY",
+			ContextWindow:  1_000_000,
+			ModelOverrides: tokenRhythmModelOverrides(),
 		}},
 	},
 	{
@@ -439,6 +537,26 @@ var curatedProviderPresets = []ProviderPreset{
 		}},
 	},
 	{
+		ID:          "deepseek-responses",
+		Label:       "DeepSeek Responses API",
+		Description: "DeepSeek official stateless Responses API for deepseek-v4-flash.",
+		KeyEnv:      "DEEPSEEK_API_KEY",
+		Entries: []ProviderEntry{{
+			Name:             "deepseek-responses",
+			Kind:             "responses",
+			BaseURL:          "https://api.deepseek.com",
+			Models:           deepSeekResponsesModels,
+			Default:          "deepseek-v4-flash",
+			APIKeyEnv:        "DEEPSEEK_API_KEY",
+			BalanceURL:       "https://api.deepseek.com/user/balance",
+			ContextWindow:    1_000_000,
+			Price:            deepSeekV4FlashPriceUSD(),
+			ResponsesMode:    "stateless",
+			SupportedEfforts: []string{"low", "high", "max"},
+			DefaultEffort:    "high",
+		}},
+	},
+	{
 		ID:          "glm-cn",
 		Label:       "GLM CN API",
 		Description: "Zhipu GLM China OpenAI-compatible API with thinking controls.",
@@ -496,7 +614,7 @@ var curatedProviderPresets = []ProviderPreset{
 			Kind:          "anthropic",
 			BaseURL:       "https://open.bigmodel.cn/api/anthropic",
 			Models:        glmAnthropicModels,
-			Default:       "glm-5.2[1m]",
+			Default:       "glm-5.2",
 			APIKeyEnv:     "GLM_PLAN_API_KEY",
 			AuthHeader:    true,
 			Thinking:      "adaptive",
@@ -529,7 +647,7 @@ var curatedProviderPresets = []ProviderPreset{
 			Kind:          "anthropic",
 			BaseURL:       "https://api.z.ai/api/anthropic",
 			Models:        glmAnthropicModels,
-			Default:       "glm-5.2[1m]",
+			Default:       "glm-5.2",
 			APIKeyEnv:     "ZAI_CODING_API_KEY",
 			AuthHeader:    true,
 			Thinking:      "adaptive",

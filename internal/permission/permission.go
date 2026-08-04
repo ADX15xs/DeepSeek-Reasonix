@@ -93,61 +93,47 @@ func ParseRule(s string) (Rule, bool) {
 		}
 		return Rule{Tool: tool, Subject: s[i+1 : len(s)-1]}, true
 	}
-	// Settings users saved these PowerShell file-writer cmdlets before the UI
-	// explained Bash(command:*) syntax. Migrate only that legacy set to shell
-	// prefixes so existing deny rules protect the real Bash call (#6950).
-	if isLegacyBarePowerShellRule(s) {
-		return Rule{Tool: "Bash", Subject: s + ":*"}, true
-	}
 	return Rule{Tool: s}, true
 }
 
-// isLegacyBarePowerShellRule is intentionally limited to the three rules users
-// reported saving through Settings before Bash(command:*) syntax was explained
-// there (#6950). Reinterpreting every Verb-Noun string would silently change
-// existing custom-tool rules in persisted configs.
-func isLegacyBarePowerShellRule(s string) bool {
+func legacyBarePowerShellDenyCmdlet(s string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "set-content", "add-content", "out-file":
-		return true
+	case "set-content":
+		return "Set-Content", true
+	case "add-content":
+		return "Add-Content", true
+	case "out-file":
+		return "Out-File", true
 	default:
-		return false
+		return "", false
 	}
 }
-
-func isPowerShellCmdletName(s string) bool {
-	verb, noun, ok := strings.Cut(s, "-")
-	if !ok || verb == "" || noun == "" || strings.Contains(noun, "-") {
-		return false
-	}
-	switch strings.ToLower(verb) {
-	case "add", "clear", "close", "convertfrom", "convertto", "copy", "disable",
-		"enable", "enter", "exit", "export", "find", "format", "get", "grant",
-		"group", "import", "install", "invoke", "join", "lock", "measure",
-		"move", "new", "open", "optimize", "out", "publish", "read", "receive",
-		"register", "remove", "rename", "reset", "resize", "resolve", "restart",
-		"restore", "resume", "revoke", "save", "search", "select", "send", "set",
-		"show", "split", "start", "stop", "submit", "suspend", "sync", "test",
-		"trace", "unblock", "uninstall", "unlock", "unpublish", "unregister",
-		"update", "use", "wait", "watch", "write":
-	default:
-		return false
-	}
-	for _, part := range []string{verb, noun} {
-		for _, r := range part {
-			if (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') {
-				return false
-			}
-		}
-	}
-	return true
-}
-
 func parseRules(ss []string) []Rule {
 	var out []Rule
 	for _, s := range ss {
 		if r, ok := ParseRule(s); ok {
 			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func parseDenyRules(ss []string) []Rule {
+	var out []Rule
+	for _, s := range ss {
+		r, ok := ParseRule(s)
+		if !ok {
+			continue
+		}
+		// Preserve the generic ToolName meaning while also recognizing the three
+		// bare PowerShell write cmdlets accepted by older Desktop settings as
+		// command prefixes. The compatibility expansion is deny-only and
+		// additive, so it cannot broaden an allow or weaken an exact tool deny.
+		out = append(out, r)
+		if r.Subject == "" {
+			if cmdlet, ok := legacyBarePowerShellDenyCmdlet(r.Tool); ok {
+				out = append(out, Rule{Tool: "Bash", Subject: cmdlet + ":*"})
+			}
 		}
 	}
 	return out
@@ -166,12 +152,23 @@ type Policy struct {
 	// Code's --allowed-tools. Deny rules still win, while these rules override
 	// configured Ask entries for the current process only.
 	SessionAllow []Rule
+	// AllowDynamicBash lets the writer fallback Mode cover command
+	// substitution and interpreter -c/-e forms. It is deliberately opt-in:
+	// broad Bash allow rules alone must not re-open nested-command bypasses.
+	AllowDynamicBash bool
 }
 
 // WithSessionAllow returns a copy of p with additional ephemeral allow rules.
 // Malformed entries are ignored consistently with New.
 func (p Policy) WithSessionAllow(rules []string) Policy {
 	p.SessionAllow = append(append([]Rule(nil), p.SessionAllow...), parseRules(rules)...)
+	return p
+}
+
+// WithAllowDynamicBashFallback enables the explicit advanced override for
+// dynamic shell shapes. Deny, ask, and exact allow rules retain precedence.
+func (p Policy) WithAllowDynamicBashFallback(enabled bool) Policy {
+	p.AllowDynamicBash = enabled
 	return p
 }
 
@@ -182,7 +179,7 @@ func New(mode string, allow, ask, deny []string) Policy {
 		Mode:  ParseDecision(mode),
 		Allow: parseRules(allow),
 		Ask:   parseRules(ask),
-		Deny:  parseRules(deny),
+		Deny:  parseDenyRules(deny),
 	}
 }
 
@@ -238,6 +235,8 @@ func (p Policy) DecideSubject(toolName string, readOnly bool, subject string) De
 		switch {
 		case requiresHuman && p.Mode == Deny:
 			return Deny
+		case requiresHuman && p.AllowDynamicBash && p.Mode == Allow:
+			return Allow
 		case requiresHuman:
 			return Ask
 		case requiresExact && readOnly:
@@ -452,7 +451,7 @@ func rawBashPrefixMatches(base, subject string) bool {
 			matched := true
 			for i, want := range baseFields {
 				got := features.CommandPrefix[i]
-				if got != want && !(i == 0 && isPowerShellCmdletName(want) && strings.EqualFold(got, want)) {
+				if got != want && !(i == 0 && isCaseInsensitivePowerShellCmdlet(want) && strings.EqualFold(got, want)) {
 					matched = false
 					break
 				}
@@ -464,14 +463,14 @@ func rawBashPrefixMatches(base, subject string) bool {
 	}
 	base = strings.TrimSpace(base)
 	subject = strings.TrimSpace(subject)
-	if subject == base || (isPowerShellCmdletName(base) && strings.EqualFold(subject, base)) {
+	if subject == base || (isCaseInsensitivePowerShellCmdlet(base) && strings.EqualFold(subject, base)) {
 		return true
 	}
 	if len(subject) <= len(base) {
 		return false
 	}
 	prefixMatches := strings.HasPrefix(subject, base)
-	if isPowerShellCmdletName(base) {
+	if isCaseInsensitivePowerShellCmdlet(base) {
 		prefixMatches = strings.EqualFold(subject[:len(base)], base)
 	}
 	if !prefixMatches {
@@ -483,6 +482,11 @@ func rawBashPrefixMatches(base, subject string) bool {
 	default:
 		return false
 	}
+}
+
+func isCaseInsensitivePowerShellCmdlet(s string) bool {
+	_, ok := legacyBarePowerShellDenyCmdlet(s)
+	return ok
 }
 
 func matchAnyExact(rules []Rule, toolName, subject string) bool {
